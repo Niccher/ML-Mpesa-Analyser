@@ -1,5 +1,14 @@
 # SMS Finance LLM Service
 
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Docker-2496ED.svg)]()
+[![Python](https://img.shields.io/badge/python-3.12-3776AB.svg)]()
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)]()
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-b10018-FF6F00.svg)]()
+[![Model](https://img.shields.io/badge/model-Qwen2.5%201.5B%20Instruct-8A2BE2.svg)]()
+[![Database](https://img.shields.io/badge/database-MySQL%208%2B-4479A1.svg)]()
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
+
 An autonomous microservice that reads unprocessed SMS messages from a MySQL database, classifies senders and extracts structured financial data using a local large language model (LLM), then writes the results back to the database — all without a hosted API dependency.
 
 Built for the M-Pesa Analyzer ecosystem. Designed to run alongside a shared MySQL instance and a CodeIgniter 4 web frontend.
