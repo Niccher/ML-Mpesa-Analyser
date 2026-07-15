@@ -114,3 +114,14 @@ class HealthResponse(BaseModel):
     llm_provider: str
     llm_model: str
     db_configured: bool
+
+
+class ProcessingJobResponse(BaseModel):
+    job_id: int
+    user_id: str
+    status: str
+    messages_processed: int = 0
+    errors: int = 0
+    duration_seconds: Optional[int] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -10,6 +11,34 @@ from sqlalchemy import text
 from app.db.connection import get_engine
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_date_to_mysql(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    raw = raw.strip().lower()
+
+    # Kenyan formats: "9/7/26 at 6:14 am", "15/7/2026 at 10:30", "9/7/2026"
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})\s+at\s+(\d{1,2}):(\d{2})\s*(am|pm)", raw)
+    if m:
+        d, mo, y, h, mi, ap = m.groups()
+        if len(y) == 2:
+            y = "20" + y
+        h = int(h)
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        return f"{y}-{int(mo):02d}-{int(d):02d} {h:02d}:{mi}:00"
+
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", raw)
+    if m:
+        d, mo, y = m.groups()
+        if len(y) == 2:
+            y = "20" + y
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+    return None
 
 
 # ── Read unprocessed SMS (Mode B) ─────────────────────────
@@ -136,6 +165,8 @@ async def insert_analyzed_transaction(
     if amount is None or amount == 0:
         return
 
+    parsed_date = _parse_date_to_mysql(trans_date)
+
     engine = get_engine()
     async with engine.connect() as conn:
         await conn.execute(
@@ -154,7 +185,7 @@ async def insert_analyzed_transaction(
                 "amount": amount,
                 "counterparty": counterparty,
                 "description": description,
-                "trans_date": trans_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "trans_date": parsed_date,
             },
         )
         await conn.commit()
@@ -225,3 +256,87 @@ async def get_processed_sender_numbers(owner: str) -> set[str]:
             {"owner": owner},
         )
         return {row[0] for row in result.fetchall()}
+
+
+# ── User-triggered processing jobs ─────────────────────────
+
+
+async def ensure_jobs_table():
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS tbl_Processing_Jobs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id VARCHAR(100) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'queued',
+                    started_at DATETIME NULL,
+                    completed_at DATETIME NULL,
+                    duration_seconds INT NULL,
+                    messages_processed INT DEFAULT 0,
+                    errors INT DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_status (user_id, status)
+                )
+            """)
+        )
+        await conn.commit()
+
+
+async def create_job(user_id: str) -> int:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                INSERT INTO tbl_Processing_Jobs (user_id, status, created_at)
+                VALUES (:user_id, 'queued', NOW())
+            """),
+            {"user_id": user_id},
+        )
+        await conn.commit()
+        return result.lastrowid
+
+
+async def update_job(job_id: int, **kwargs):
+    sets = []
+    params: dict = {"id": job_id}
+    for key, val in kwargs.items():
+        sets.append(f"{key} = :{key}")
+        params[key] = val
+    if not sets:
+        return
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(f"UPDATE tbl_Processing_Jobs SET {', '.join(sets)} WHERE id = :id"),
+            params,
+        )
+        await conn.commit()
+
+
+async def fetch_unprocessed_sms_by_owner(owner: str, batch_size: int) -> list[dict]:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT s.id, s.sms_number, s.sms_body, s.sms_owner, s.sms_time
+                FROM tbl_Sms s
+                LEFT JOIN tbl_Sms_Processing p ON p.sms_id = s.id
+                WHERE (p.sms_id IS NULL OR p.status = 'error')
+                  AND s.sms_owner = :owner
+                ORDER BY s.id ASC
+                LIMIT :limit
+            """),
+            {"owner": owner, "limit": batch_size},
+        )
+        rows = result.fetchall()
+        return [
+            {
+                "id": row[0],
+                "sms_number": row[1] or "",
+                "sms_body": row[2] or "",
+                "sms_owner": row[3] or "",
+                "sms_time": row[4] or "",
+            }
+            for row in rows
+        ]

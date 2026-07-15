@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -11,14 +12,18 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db.connection import verify_connection, close_engine
 from app.db.queries import (
+    create_job,
+    ensure_jobs_table,
     ensure_tracking_table,
     fetch_unprocessed_sms,
+    fetch_unprocessed_sms_by_owner,
     insert_analyzed_transaction,
     mark_processing,
+    update_job,
     update_sms_with_parsed,
     upsert_sender_profile,
 )
-from app.models.schemas import HealthResponse, SenderClassification
+from app.models.schemas import HealthResponse, ProcessingJobResponse, SenderClassification
 from app.services.classifier import SenderClassifier
 from app.services.extractor import MessageExtractor
 from app.services.llm_service import llm
@@ -37,9 +42,8 @@ _processing_lock = asyncio.Lock()
 # ── Core processing logic (shared by background & API) ────
 
 
-async def run_processing() -> dict:
-    await ensure_tracking_table()
-    rows = await fetch_unprocessed_sms(settings.batch_size)
+async def process_rows(rows: list[dict]) -> dict:
+    """Process a list of SMS rows (sender classification + extraction)."""
     if not rows:
         return {"senders_classified": 0, "messages_processed": 0, "finance_senders_found": 0, "transactional_inserted": 0, "errors": 0}
 
@@ -161,6 +165,12 @@ async def run_processing() -> dict:
     }
 
 
+async def run_processing() -> dict:
+    await ensure_tracking_table()
+    rows = await fetch_unprocessed_sms(settings.batch_size)
+    return await process_rows(rows)
+
+
 # ── Background poller ─────────────────────────────────────
 
 
@@ -247,3 +257,69 @@ async def trigger_processing():
 async def process_db():
     """Alias for /process/trigger — one processing cycle."""
     return await trigger_processing()
+
+
+@app.post("/process/for-user/{user_id}", response_model=ProcessingJobResponse)
+async def process_for_user(user_id: str):
+    """Process unprocessed SMS for a specific user.
+
+    The PHP webapp inserts a row into tbl_Processing_Jobs with
+    status='queued' before calling this endpoint. This endpoint
+    picks it up, runs the LLM pipeline, and marks it done.
+    """
+    await ensure_tracking_table()
+    await ensure_jobs_table()
+
+    job_id = await create_job(user_id)
+    await update_job(job_id, status="starting", started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    start = datetime.now()
+
+    rows = await fetch_unprocessed_sms_by_owner(user_id, settings.batch_size)
+    if not rows:
+        elapsed = int((datetime.now() - start).total_seconds())
+        await update_job(
+            job_id,
+            status="done",
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            duration_seconds=elapsed,
+            messages_processed=0,
+            errors=0,
+        )
+        return ProcessingJobResponse(
+            job_id=job_id, user_id=user_id, status="done",
+            messages_processed=0, errors=0, duration_seconds=elapsed,
+            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    try:
+        result = await process_rows(rows)
+        elapsed = int((datetime.now() - start).total_seconds())
+        await update_job(
+            job_id,
+            status="done",
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            duration_seconds=elapsed,
+            messages_processed=result["messages_processed"],
+            errors=result["errors"],
+        )
+        return ProcessingJobResponse(
+            job_id=job_id,
+            user_id=user_id,
+            status="done",
+            messages_processed=result["messages_processed"],
+            errors=result["errors"],
+            duration_seconds=elapsed,
+            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    except Exception as e:
+        elapsed = int((datetime.now() - start).total_seconds())
+        await update_job(job_id, status="error", completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), duration_seconds=elapsed)
+        logger.error(f"User processing failed for {user_id}: {e}")
+        return ProcessingJobResponse(
+            job_id=job_id, user_id=user_id, status="error",
+            duration_seconds=elapsed,
+            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
