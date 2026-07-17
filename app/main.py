@@ -22,6 +22,7 @@ from app.db.queries import (
     update_job,
     update_sms_with_parsed,
     upsert_sender_profile,
+    upsert_sms_classification,
 )
 from app.models.schemas import HealthResponse, ProcessingJobResponse, SenderClassification
 from app.services.classifier import SenderClassifier
@@ -106,6 +107,31 @@ async def process_rows(rows: list[dict]) -> dict:
             )
         except Exception as e:
             logger.error(f"Failed to upsert sender profile for {data['number']}: {e}")
+
+        # Write classification for ALL SMS regardless of finance status
+        for sms_id, body_text in zip(data["sms_ids"], data["bodies"]):
+            try:
+                direction = "none"
+                category = cls.category.value if hasattr(cls.category, 'value') else str(cls.category)
+                if cls.is_finance:
+                    # Infer direction from body keywords for classification
+                    body_lower = body_text.lower()
+                    if any(w in body_lower for w in ["received", "credited", "deposit"]):
+                        direction = "incoming"
+                    elif any(w in body_lower for w in ["sent", "paid", "withdrawn", "transfer to"]):
+                        direction = "outgoing"
+
+                await upsert_sms_classification(
+                    sms_id=sms_id,
+                    sender=data["number"],
+                    category=category,
+                    direction=direction,
+                    is_finance=cls.is_finance,
+                    confidence=cls.confidence,
+                    method="llm",
+                )
+            except Exception as e:
+                logger.error(f"Failed to write classification for SMS {sms_id}: {e}")
 
         if not cls.is_finance:
             for sms_id in data["sms_ids"]:

@@ -191,6 +191,45 @@ async def insert_analyzed_transaction(
         await conn.commit()
 
 
+# ── Classification helpers ─────────────────────────────────
+
+
+async def upsert_sms_classification(
+    sms_id: int,
+    sender: str,
+    category: str,
+    direction: str,
+    is_finance: bool,
+    confidence: float,
+    method: str = "llm",
+):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("""
+                INSERT INTO tbl_Sms_Classification (sms_id, sender, category, direction, is_finance, method, confidence, created_at)
+                VALUES (:sid, :sender, :category, :direction, :is_finance, :method, :confidence, NOW())
+                ON DUPLICATE KEY UPDATE
+                    sender = VALUES(sender),
+                    category = VALUES(category),
+                    direction = VALUES(direction),
+                    is_finance = VALUES(is_finance),
+                    method = VALUES(method),
+                    confidence = VALUES(confidence)
+            """),
+            {
+                "sid": sms_id,
+                "sender": sender,
+                "category": category,
+                "direction": direction,
+                "is_finance": 1 if is_finance else 0,
+                "method": method,
+                "confidence": confidence,
+            },
+        )
+        await conn.commit()
+
+
 # ── Sender profile helpers ─────────────────────────────────
 
 
