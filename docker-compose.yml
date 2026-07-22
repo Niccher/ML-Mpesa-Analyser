@@ -1,12 +1,13 @@
 version: "3.9"
 
 services:
-  sms-finance-llm:
+  ml-mpesa-analyzer:
     build: .
-    container_name: sms-finance-llm
+    container_name: ${CONTAINER_ML_MPESA_ANALYZER:-ml-mpesa-analyzer}
     ports:
-      - "8080:8080"   # llama.cpp server
-      - "9050:9050"   # FastAPI app
+      - "${ML_MPESA_ANALYZER_LLAMA_PORT:-9022}:8080"
+      - "${ML_MPESA_ANALYZER_API_PORT:-9021}:9050"
+    image: ${IMAGE_ML_MPESA_ANALYZER:-ml-mpesa-analyzer}
     env_file:
       - .env
     environment:
@@ -15,3 +16,10 @@ services:
       - LLM_MODEL=qwen2.5-1.5b-instruct
       - LLM_PROVIDER=openai-compatible
     restart: unless-stopped
+    networks:
+      - ${NETWORK_NAME:-hosts-shared-network}
+
+networks:
+  hosts-shared-network:
+    name: ${NETWORK_NAME:-hosts-shared-network}
+    external: true
