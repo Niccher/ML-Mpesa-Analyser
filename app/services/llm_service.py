@@ -7,6 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.services.prompt_manager import resolve as resolve_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -71,26 +72,10 @@ class LLMService:
         sample = sms_messages[:10]
         formatted = "\n---\n".join(f"[{i+1}] {m[:300]}" for i, m in enumerate(sample))
 
-        prompt = (
-            "You are a financial SMS classifier. Determine whether the sender of "
-            "the following SMS messages is finance-related.\n\n"
-            "Finance-related senders include: banks, mobile money services (MPESA, "
-            "Airtel Money, T-Kash), SACCOS, fintech lenders (Tala, Branch, Zenka), "
-            "insurance companies, payment aggregators (PesaLink, eCitizen), and "
-            "government revenue authorities (KRA).\n\n"
-            "Non-finance senders include: marketing/promotional numbers, social media, "
-            "utilities (unless payment confirmations), ride-hailing, e-commerce order "
-            "confirmations, and general service notifications that do not involve money.\n\n"
-            f"Sender name: {sender}\n\n"
-            f"Sample SMS messages from this sender:\n{formatted}\n\n"
-            "Respond with valid JSON only, using this exact schema:\n"
-            "{\n"
-            '    "sender": "<sender>",\n'
-            '    "is_finance": true/false,\n'
-            '    "confidence": 0.0-1.0,\n'
-            '    "category": "Mobile Money" | "Bank" | "SACCO" | "Fintech" | "Insurance" | "Payments/Govt" | "Other Finance" | "Non-Finance",\n'
-            '    "reasoning": "brief explanation"\n'
-            "}"
+        prompt = await resolve_prompt(
+            "classify_sender",
+            sender=sender,
+            sms_messages=formatted,
         )
 
         raw = await self._call_llm(
@@ -104,37 +89,9 @@ class LLMService:
             f"{i} | {body[:500]}" for i, body in enumerate(sms_bodies)
         )
 
-        prompt = (
-            "You are a financial data extractor. Parse each of the following SMS "
-            "messages and extract structured financial information.\n\n"
-            "For each message:\n"
-            "- is_transactional: true if this SMS describes a financial transaction "
-            "(money movement, balance change, payment, deposit). false if it is a "
-            "notification (OTP, promo, maintenance alert, general info).\n"
-            "- amount_before: balance before the transaction, if explicitly stated. null otherwise.\n"
-            "- amount_after: balance after the transaction, if explicitly stated. null otherwise.\n"
-            "- amount_changed: the transaction amount. null if not found or not transactional.\n"
-            '- direction: "sent" if money left, "received" if money came in, "none" if not applicable.\n'
-            "- transaction_time: any date/time mentioned. null if not present.\n"
-            "- counterparty: the other party. null if not present.\n"
-            "- transaction_reference: any reference code. null if not present.\n"
-            '- transaction_type: "transfer", "payment", "deposit", "withdrawal", "loan", "repayment", "salary", "fee", "interest", "refund", "other", "unknown"\n\n'
-            f"Messages (index | body):\n{items}\n\n"
-            "Respond with a valid JSON array only. One object per message, in the same order:\n"
-            "[\n"
-            "  {\n"
-            '    "body": "original SMS text (truncated to 120 chars)",\n'
-            '    "is_transactional": true/false,\n'
-            '    "amount_before": null or number,\n'
-            '    "amount_after": null or number,\n'
-            '    "amount_changed": null or number,\n'
-            '    "direction": "sent" | "received" | "none",\n'
-            '    "transaction_time": null or string,\n'
-            '    "counterparty": null or string,\n'
-            '    "transaction_reference": null or string,\n'
-            '    "transaction_type": "transfer" | "payment" | "deposit" | "withdrawal" | "loan" | "repayment" | "salary" | "fee" | "interest" | "refund" | "other" | "unknown"\n'
-            "  }\n"
-            "]"
+        prompt = await resolve_prompt(
+            "extract_batch",
+            messages_list=items,
         )
 
         raw = await self._call_llm(

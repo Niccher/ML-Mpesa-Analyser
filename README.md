@@ -56,7 +56,7 @@ This service is the **intelligence layer** of the M-Pesa Analyzer stack. The thr
 | **1. Capture** | Reads SMS from device, encrypts with AES-128-CBC | — | — |
 | **2. Upload** | Sends encrypted file via `POST /process/upload` | Decrypts, parses JSON, stores SMS in `tbl_Sms` | — |
 | **3. Process** | — | Inserts job in `tbl_Processing_Jobs`, calls `POST /process/for-user/{id}` | Polls `tbl_Sms` (or triggered by web), classifies senders & extracts amounts |
-| **4. Enrich** | — | — | Updates `tbl_Sms` with extracted data, creates `tbl_Analyzed_Transactions`, `tbl_Sender_Profiles`, `tbl_Sms_Classification` |
+| **4. Enrich** | — | — | Updates `tbl_Sms` (single canonical record) with classification + parsed data, upserts `tbl_Sender_Profiles`; `tbl_Sms_Classification` and `tbl_Analyzed_Transactions` are now **views** over `tbl_Sms` |
 | **5. Visualise** | Fetches summaries via `get/my_uploads`, `get/my_summary_calculations` | Dashboard shows classified transactions, budgets, reports | — |
 
 ---
@@ -74,18 +74,19 @@ This service is the **intelligence layer** of the M-Pesa Analyzer stack. The thr
 │  │  Qwen2.5 1.5B Q4_K_M    │◄──────│  /health                    ││
 │  │  GGUF model             │       │  /process/trigger           ││
 │  └────────────────────────┘       │  /process/for-user/{id}     ││
-│            ▲                       └──────────┬──────────────────┘│
-│            │                                  │                   │
+│            ▲                       │  /admin/* (management)      ││
+│            │                       └──────────┬──────────────────┘│
 │            │              ┌────────────────────▼─────────────┐    │
-│            │              │  Background Poller (every 30s)    │    │
+│            │              │  Background Poller (POLL_INTERVAL)│   │
+│            │              │  Gate: admin auto-jobs toggle     │   │
 │            │              │                                  │    │
 │            │              │  1. Query unprocessed SMS         │    │
 │            │              │  2. Group by sender number        │    │
 │            │              │  3. Classify sender (known-dict   │    │
-│            │              │     or LLM)                       │    │
+│            │              │     or LLM, DB prompt override)   │    │
 │            │              │  4. Upsert sender profile         │    │
 │            │              │  5. Extract transactions (LLM)    │    │
-│            │              │  6. Write to DB (SMS + txns)      │    │
+│            │              │  6. Write one canonical row/tbl_Sms│   │
 │            │              └──────────────────────────────────┘    │
 │            │                                                      │
 └────────────┼──────────────────────────────────────────────────────┘
@@ -95,20 +96,23 @@ This service is the **intelligence layer** of the M-Pesa Analyzer stack. The thr
 │                  Shared MySQL 8.4 Database                    │
 │                  db_mpesa_analyzer                            │
 │                                                               │
-│  tbl_Sms ──── sms_body (base64), sms_direction, sms_amount,   │
-│               sms_balance, sms_counterparty, sms_transaction_ │
-│               type, sms_is_transactional                       │
+│  tbl_Sms (CANONICAL) ── classification columns                │
+│    sms_category, sms_is_finance, sms_confidence, sms_method   │
+│    + parsed: sms_direction, sms_amount, sms_balance,          │
+│      sms_counterparty, sms_transaction_type,                  │
+│      sms_is_transactional, sms_trans_id, sms_trans_date       │
 │                                                               │
 │  tbl_Sender_Profiles ── sp_number, sp_name, sp_category,      │
 │                         sp_is_finance, sp_confidence           │
 │                                                               │
 │  tbl_Sms_Processing ── sms_id, status, attempt_count, errors  │
 │                                                               │
-│  tbl_Sms_Classification ── sender, category, direction,       │
-│                            is_finance, confidence, method      │
+│  VIEW tbl_Sms_Classification ── derived from tbl_Sms          │
+│  VIEW tbl_Analyzed_Transactions ── derived from tbl_Sms       │
 │                                                               │
-│  tbl_Analyzed_Transactions ── amount, counterparty,            │
-│                               description, trans_date          │
+│  tbl_Processing_Jobs ── job runs + metadata (JSON)            │
+│  tbl_LLM_Prompts ── versioned prompt overrides                │
+│  tbl_ML_Controls ── admin toggles (auto_jobs_enabled)         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -117,12 +121,12 @@ This service is the **intelligence layer** of the M-Pesa Analyzer stack. The thr
 ## Classification Pipeline (Step by Step)
 
 ### Step 1: Polling
-The background poller runs every `POLL_INTERVAL` (default 30s). It queries `tbl_Sms` for rows with no `tbl_Sms_Processing` record, or with `status = 'error'`. Batches are fetched in configurable sizes (`BATCH_SIZE`, default 5).
+The background poller runs every `POLL_INTERVAL` (default 30s). It only runs while the admin **auto-jobs toggle** is enabled (`tbl_ML_Controls.auto_jobs_enabled`). It queries `tbl_Sms` for rows with no `tbl_Sms_Processing` record, or with `status = 'error'`. Batches are fetched in configurable sizes (`BATCH_SIZE`, default 5).
 
 ### Step 2: Sender Classification
 Messages are grouped by sender phone number. For each sender:
 
-1. **Known-sender lookup** — checks a built-in curated dictionary (`FINANCE_CATEGORIES` in `prompt_templates.py`) covering 60+ Kenyan financial senders across 7 categories:
+1. **Known-sender lookup** — checks the allowed-sender list, loaded **DB-first from `tbl_Allowed_Senders`**, falling back to a built-in curated dictionary (`FINANCE_CATEGORIES` in `prompt_templates.py`) covering 60+ Kenyan financial senders across 7 categories:
    - **Mobile Money**: MPESA, Airtel Money, T-Kash, Telkom
    - **Bank**: KCB, Equity, NCBA, Co-op, Absa, StanChart, I&M, Stanbic, DTB, Sidian, Family Bank, Credit Bank, BOA, EcoBank, UBA, and more
    - **Fintech**: M-Shwari, Tala, Branch, Zenka, Timiza, Hustler Fund, OKash, KCB M-PESA
@@ -132,13 +136,17 @@ Messages are grouped by sender phone number. For each sender:
    
    If found: returns classification with 0.95 confidence immediately — **zero LLM calls** for known senders.
 
-2. **LLM classification** — for unknown senders, sends up to 10 sample SMS messages to the LLM with a structured prompt asking for: `is_finance`, `category`, `confidence`, `reasoning`.
+2. **LLM classification** — for unknown senders, sends up to 10 sample SMS messages to the LLM asking for: `is_finance`, `category`, `confidence`, `reasoning`.
+
+The prompt used is resolved by `prompt_manager`: an **active DB prompt** in `tbl_LLM_Prompts` (per key `classify_sender`) takes precedence, otherwise the **hardcoded default** template is used. Admins can version prompts via the admin API — edits always create a new version.
 
 ### Step 3: Profile Persistence
 Each sender's classification is upserted into `tbl_Sender_Profiles`. This creates a persistent cache — once a sender is classified, subsequent encounters skip the LLM and use the stored profile.
 
-### Step 4: Classification Persistence
-Every SMS gets a row in `tbl_Sms_Classification` recording its: sender, category, direction (incoming/outgoing), is_finance flag, confidence score, method (llm or known).
+### Step 4: Single Canonical Write
+Every SMS is written **once** to `tbl_Sms` via `upsert_sms_analysis()` — a single row carrying both the classification (`sms_category`, `sms_is_finance`, `sms_confidence`, `sms_method`, `sms_direction`) and, for finance senders, the parsed fields (`sms_amount`, `sms_balance`, `sms_counterparty`, `sms_transaction_type`, `sms_is_transactional`, `sms_trans_id`, `sms_trans_date`).
+
+`tbl_Sms_Classification` and `tbl_Analyzed_Transactions` are **MySQL VIEWs** derived from `tbl_Sms` — they are never written to directly, so there is exactly one source of truth per SMS.
 
 ### Step 5: Transaction Extraction
 For SMS from finance-category senders, messages are batched (default 5 per call) and sent to the LLM for structured extraction:
@@ -158,11 +166,12 @@ Output: {
 }
 ```
 
-### Step 6: DB Write-Back
-For each extracted message:
-- `tbl_Sms` is updated with: direction, amount, balance, counterparty, transaction_type, is_transactional
-- If the message is transactional with a non-zero amount, a row is inserted into `tbl_Analyzed_Transactions`
-- `tbl_Sms_Processing` status is set to `done` (or `error` with the error message)
+The extraction prompt (`extract_batch`) is likewise resolved from the active DB prompt or the hardcoded default.
+
+### Step 6: Job Recording & Metadata
+- Non-finance senders' SMS are marked `skipped` and are not extracted.
+- Finance senders' SMS are extracted; transactional ones increment the job's `transactional_inserted` count; each is marked `done` (or `error`).
+- Every user-triggered job (`/process/for-user/{id}`) records rich metadata in `tbl_Processing_Jobs.metadata` (JSON): sender/SMS breakdowns (total / finance / unwanted / skipped), category counts, direction counts, model + model path, LLM tuning (tokens, temperature, context, batch, GPU layers), batch/retries/poll settings, duration, and errors. The webapp surfaces this in the user-facing ML Jobs report.
 
 ---
 
@@ -202,10 +211,12 @@ The service is model-agnostic via the OpenAI-compatible API. Any GGUF model load
 | **Qwen2.5 0.5B Instruct** | 0.5B | Q4_K_M | ~0.4 GB | Fastest, lowest accuracy |
 
 **To swap models:**
-1. Download a different GGUF file into `models/`
-2. Update `MODEL_PATH` in `docker-compose.yml` or `.env`
+1. Download a different GGUF file into `models/` (mounted into the container at `/models/`)
+2. Either activate it through the admin UI / `POST /admin/models/activate`, or update `MODEL_PATH` in `docker-compose.yml` / `.env`
 3. Update `LLM_MODEL` to match the model name
-4. Rebuild: `docker compose up -d --build`
+4. Rebuild / restart: `docker compose up -d --build`
+
+Models can also be **uploaded** through the admin API (`POST /admin/models/upload`, multipart `.gguf`/`.bin`) and deleted (`POST /admin/models/delete`). GGUF metadata (parameter count, quantization, context length, architecture) is read automatically from the file header and surfaced via the admin status/model endpoints.
 
 The `LLM_PROVIDER` can also be switched to any OpenAI-compatible API (`openai/gpt-4o-mini`, `anthropic/claude-3-haiku`, `groq/llama-3.1-8b`, etc.) by changing `LLM_BASE_URL` and `LLM_API_KEY` — no code changes required.
 
@@ -231,14 +242,17 @@ Dockerfile
 
 1. **Start llama-server** as background process:
    ```
-   llama-server --model /models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+   llama-server --model ${MODEL_PATH} \
                 --port 8080 --host 0.0.0.0 \
-                --ctx-size 16384 --batch-size 512 \
-                --n-gpu-layers 0 --mlock
+                --ctx-size ${LLM_CTX_SIZE} \
+                --batch-size ${LLM_BATCH_SIZE} \
+                --n-gpu-layers ${N_GPU_LAYERS} \
+                --mlock
    ```
    - `--mlock` pins model in RAM (prevents swapping)
    - `--n-gpu-layers 0` forces CPU-only inference
    - `--ctx-size 16384` supports large batch prompts
+   - Context / batch / GPU layers are **env-driven**, so config changes apply on restart
 
 2. **Health-check loop** — polls `http://localhost:8080/health` up to 60 times (2s intervals) until llama-server responds
 
@@ -249,7 +263,7 @@ Dockerfile
 | Port | Service | Purpose |
 |------|---------|---------|
 | 8080 | llama-server | OpenAI-compatible chat completions API |
-| 9050 | FastAPI | Health, trigger, and user-processing endpoints |
+| 9050 | FastAPI | Health, processing, and admin management endpoints |
 
 ### Environment Variables
 
@@ -259,6 +273,10 @@ Dockerfile
 | `LLM_BASE_URL` | `http://localhost:8080/v1` | LLM API endpoint |
 | `LLM_MODEL` | `qwen2.5-1.5b-instruct` | Model name sent to LLM |
 | `LLM_MAX_TOKENS` | `2048` | Max response tokens |
+| `LLM_TEMPERATURE` | `0.2` | Sampling temperature for the LLM |
+| `LLM_CTX_SIZE` | `16384` | llama.cpp context window (applied on restart) |
+| `LLM_BATCH_SIZE` | `512` | llama.cpp prompt-processing batch (applied on restart) |
+| `N_GPU_LAYERS` | `0` | Layers offloaded to GPU, 0 = CPU only (applied on restart) |
 | `DB_HOST` | `mysql` | MySQL server hostname |
 | `DB_PORT` | `3306` | MySQL port |
 | `DB_USER` | `root` | MySQL user |
@@ -267,6 +285,8 @@ Dockerfile
 | `BATCH_SIZE` | `5` | SMS per LLM extraction call |
 | `POLL_INTERVAL` | `30` | Background poll interval (seconds) |
 | `MAX_RETRIES` | `3` | Max retries per message |
+| `MODEL_PATH` | `/models/qwen2.5-1.5b-instruct-q4_k_m.gguf` | Active model file loaded by llama-server |
+| `MODEL_DIR` | `/models` | Directory scanned for available model files |
 
 ---
 
@@ -328,7 +348,7 @@ Returns service health:
 ```
 
 ### `POST /process/trigger`
-Manually trigger one processing cycle:
+Manually trigger one processing cycle (blocked when auto jobs are disabled):
 ```json
 {"senders_classified": 1, "messages_processed": 20, "finance_senders_found": 1, "transactional_inserted": 3, "errors": 0}
 ```
@@ -338,6 +358,31 @@ Process unprocessed SMS for a specific user (called by CI4 web backend):
 ```json
 {"job_id": 42, "user_id": "abc123", "status": "done", "messages_processed": 15, "errors": 0, "duration_seconds": 12}
 ```
+
+### `POST /process/db`
+Alias for `/process/trigger` — one processing cycle.
+
+### Admin endpoints (`/admin/*`)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/admin/status` | GET | Full backend status: health, config, model files + GGUF metadata, DB, uptime, `auto_jobs_enabled` |
+| `/admin/models` | GET | List available model files with GGUF metadata + active model path |
+| `/admin/models/upload` | POST | Upload a `.gguf`/`.bin` model (multipart `file`), streamed in 1 MB chunks |
+| `/admin/models/activate` | POST | Mark a model active (updates `MODEL_PATH`/`LLM_MODEL`); restart required |
+| `/admin/models/delete` | POST | Delete a model file (active and non-GGUF files are refused) |
+| `/admin/config` | POST | Update in-memory config + `.env` (model, tokens, temperature, ctx, batch, GPU layers, batch size, retries, poll) |
+| `/admin/test-prompt` | POST | Run a classification + extraction on sample messages to verify the LLM |
+| `/admin/prompts` | GET | List prompt versions + per-key resolution (DB active vs hardcoded default) |
+| `/admin/prompts` | POST | Create a new prompt version (edit = new version, set active) |
+| `/admin/prompts/{id}/activate` | POST | Activate an existing prompt version |
+| `/admin/prompts/{id}/delete` | POST | Delete a prompt version (active versions blocked) |
+| `/admin/jobs/status` | GET | Auto-jobs toggle state + aggregate totals from recent jobs |
+| `/admin/jobs/auto` | POST | `{"enabled": bool}` — start/stop the background poller |
+| `/admin/jobs` | GET | Recent processing jobs with full metadata |
+| `/admin/allowed/defaults` | GET | The hardcoded default finance senders (fallback allowlist) |
+
+**Auto-jobs control:** when `POST /admin/jobs/auto {"enabled": false}`, the background poller goes idle and `/process/trigger`, `/process/db` and `/process/for-user/{id}` are all blocked (the latter records a job with `status: disabled`). The toggle is persisted in `tbl_ML_Controls` so it survives restarts.
 
 ---
 
@@ -369,24 +414,28 @@ For the full stack (MySQL + Web + LLM), add the service to the project-level `do
 
 ```
 ├── app/
-│   ├── main.py                    # FastAPI app, poller, API endpoints
-│   ├── config.py                  # Environment-driven settings
+│   ├── main.py                    # FastAPI app, poller, processing pipeline, API endpoints
+│   ├── config.py                  # Environment-driven settings (LLM tuning, DB, processing)
 │   ├── db/
 │   │   ├── connection.py          # Async SQLAlchemy engine
-│   │   └── queries.py             # All SQL operations
+│   │   └── queries.py             # All SQL operations (canonical writes, prompts, jobs, controls)
 │   ├── models/
 │   │   └── schemas.py             # Pydantic models & enums
+│   ├── routers/
+│   │   └── admin.py               # Admin management API (models, config, prompts, jobs, toggle)
 │   ├── services/
 │   │   ├── classifier.py          # Sender classification (known-dict + LLM)
 │   │   ├── extractor.py           # Batch transaction extraction
-│   │   └── llm_service.py         # OpenAI-compatible LLM client
+│   │   ├── llm_service.py         # OpenAI-compatible LLM client
+│   │   ├── prompt_manager.py      # Prompt resolution (DB override → hardcoded default)
+│   │   └── gguf_metadata.py       # GGUF model header metadata reader
 │   └── utils/
-│       └── prompt_templates.py    # Prompts + 60+ known sender dictionary
+│       └── prompt_templates.py    # Default prompts + 60+ known sender dictionary
 ├── llama-bin/                     # Pre-built llama.cpp binaries
 ├── models/                        # GGUF model files
 ├── tests/                         # Pytest tests
 ├── Dockerfile                     # Container build
-├── entrypoint.sh                  # Startup script
+├── entrypoint.sh                  # Startup script (llama-server + health wait + uvicorn)
 ├── docker-compose.yml             # Standalone deployment
 └── requirements.txt               # Python dependencies
 ```
@@ -403,7 +452,10 @@ python -m pytest tests/
 
 ### Adding a Known Sender
 
-Edit `app/utils/prompt_templates.py` — add the sender name (uppercase) to the appropriate category in `FINANCE_CATEGORIES`. Match is case-insensitive.
+Two ways:
+
+1. **Via the DB allowlist (recommended)** — insert a row into `tbl_Allowed_Senders` (`sender`, `category`). The backend reads this first and falls back to the hardcoded list only when it's empty. The webapp's admin *Allowed Senders* page manages this table.
+2. **Hardcoded fallback** — edit `app/utils/prompt_templates.py`, adding the sender name (uppercase) to the appropriate category in `FINANCE_CATEGORIES`. Match is case-insensitive. These defaults are also exposed via `GET /admin/allowed/defaults` so the webapp can show them even before the user has matching data.
 
 ### Running Without Docker
 

@@ -6,9 +6,17 @@ dist/
 build/
 *.egg
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.coverage.*
+coverage.xml
 
-# ── Environment ─────────────────────────────────────────────
+# ── Environment / Secrets ───────────────────────────────────
 .env
+.env.*
+!.env.example
 
 # ── IDE / Editor ────────────────────────────────────────────
 .idea/
@@ -16,16 +24,26 @@ build/
 *.swp
 *.swo
 *~
+*.code-workspace
 
 # ── OS ──────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+.directory
+.Trash-*
 
-# ── Large binary assets (download on build) ─────────────────
+# ── Large binary assets (downloaded on build) ───────────────
 models/*.gguf
+models/*.bin
 llama-bin/llama-server
 llama-bin/*.so*
-llama-bin/*.so
+llama-bin/*.dll
+llama-bin/*.dylib
 
 # ── Docker ──────────────────────────────────────────────────
 .docker/
+docker-compose.override.yml
+
+# ── Logs ────────────────────────────────────────────────────
+*.log
+logs/

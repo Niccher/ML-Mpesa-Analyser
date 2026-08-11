@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from app.db.queries import get_allowed_senders
 from app.models.schemas import FinanceCategory, SenderClassification
 from app.services.llm_service import llm
 from app.utils.prompt_templates import FINANCE_CATEGORIES
@@ -11,24 +12,47 @@ logger = logging.getLogger(__name__)
 
 
 class SenderClassifier:
+    # Hardcoded fallback list. Used only when tbl_Allowed_Senders is empty
+    # (or unreadable). The DB list takes precedence when it has entries.
     KNOWN_FINANCE: dict[str, FinanceCategory] = {}
 
     @classmethod
-    def _build_lookup(cls):
-        if not cls.KNOWN_FINANCE:
-            for cat, senders in FINANCE_CATEGORIES.items():
-                for s in senders:
-                    cls.KNOWN_FINANCE[s.upper()] = FinanceCategory(cat)
+    def _build_hardcoded(cls):
+        for cat, senders in FINANCE_CATEGORIES.items():
+            for s in senders:
+                cls.KNOWN_FINANCE[s.upper()] = FinanceCategory(cat)
+
+    @classmethod
+    async def reload_allowed(cls) -> None:
+        """Refresh the known-finance lookup from the DB.
+
+        DB first; if the table is empty or the query fails, fall back to the
+        hardcoded FINANCE_CATEGORIES.
+        """
+        try:
+            db_allowed = await get_allowed_senders()
+            if db_allowed:
+                cls.KNOWN_FINANCE = {
+                    sender: FinanceCategory(cat) if cat else FinanceCategory("Other Finance")
+                    for sender, cat in db_allowed.items()
+                }
+                logger.info(f"Using {len(db_allowed)} allowed senders from DB.")
+                return
+            logger.info("Allowed senders table empty — using hardcoded fallback list.")
+        except Exception as e:
+            logger.warning(f"Could not load allowed senders from DB ({e}); using hardcoded fallback.")
+        cls.KNOWN_FINANCE = {}
+        cls._build_hardcoded()
 
     @classmethod
     async def classify(
         cls, sender: str, sms_messages: list[str]
     ) -> SenderClassification:
-        cls._build_lookup()
-
         sender_upper = sender.upper().strip()
 
-        # If sender is in known list, return immediately
+        # If sender is in the allowed list (DB or hardcoded fallback), return
+        # immediately as finance — skip LLM classification. Extraction still
+        # runs for finance senders downstream.
         if sender_upper in cls.KNOWN_FINANCE:
             cat = cls.KNOWN_FINANCE[sender_upper]
             return SenderClassification(

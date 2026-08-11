@@ -119,7 +119,7 @@ async def mark_processing(sms_id: int, status: str, error: Optional[str] = None)
 # ── Write parsed data ──────────────────────────────────────
 
 
-async def update_sms_with_parsed(
+async def upsert_sms_analysis(
     sms_id: int,
     direction: Optional[str],
     amount: Optional[float],
@@ -127,7 +127,20 @@ async def update_sms_with_parsed(
     counterparty: Optional[str],
     transaction_type: Optional[str],
     is_transactional: bool,
+    category: Optional[str],
+    is_finance: Optional[bool],
+    confidence: Optional[float],
+    method: Optional[str],
+    trans_date: Optional[str] = None,
 ):
+    """Single canonical write: persist classification + parsed data to tbl_Sms.
+
+    tbl_Sms is the single source of truth for per-SMS analysis. The old
+    tbl_Sms_Classification and tbl_Analyzed_Transactions tables are now VIEWs
+    derived from tbl_Sms, so they must not be written to directly.
+    """
+    parsed_date = _parse_date_to_mysql(trans_date) if trans_date else None
+
     engine = get_engine()
     async with engine.connect() as conn:
         await conn.execute(
@@ -139,7 +152,12 @@ async def update_sms_with_parsed(
                     sms_balance = :balance,
                     sms_counterparty = :counterparty,
                     sms_transaction_type = :transaction_type,
-                    sms_is_transactional = :is_transactional
+                    sms_is_transactional = :is_transactional,
+                    sms_category = :category,
+                    sms_is_finance = :is_finance,
+                    sms_confidence = :confidence,
+                    sms_method = :method,
+                    sms_trans_date = :trans_date
                 WHERE id = :sid
             """),
             {
@@ -150,81 +168,11 @@ async def update_sms_with_parsed(
                 "counterparty": counterparty,
                 "transaction_type": transaction_type,
                 "is_transactional": 1 if is_transactional else 0,
-            },
-        )
-        await conn.commit()
-
-
-async def insert_analyzed_transaction(
-    sms_id: int,
-    amount: Optional[float],
-    counterparty: Optional[str],
-    description: Optional[str],
-    trans_date: Optional[str],
-):
-    if amount is None or amount == 0:
-        return
-
-    parsed_date = _parse_date_to_mysql(trans_date)
-
-    engine = get_engine()
-    async with engine.connect() as conn:
-        await conn.execute(
-            text("""
-                INSERT INTO tbl_Analyzed_Transactions
-                    (orig_sms_int_id, amount, counterparty, description, trans_date, created_at)
-                VALUES
-                    (:sid, :amount, :counterparty, :description, :trans_date, NOW())
-                ON DUPLICATE KEY UPDATE
-                    amount = VALUES(amount),
-                    counterparty = VALUES(counterparty),
-                    description = VALUES(description)
-            """),
-            {
-                "sid": sms_id,
-                "amount": amount,
-                "counterparty": counterparty,
-                "description": description,
-                "trans_date": parsed_date,
-            },
-        )
-        await conn.commit()
-
-
-# ── Classification helpers ─────────────────────────────────
-
-
-async def upsert_sms_classification(
-    sms_id: int,
-    sender: str,
-    category: str,
-    direction: str,
-    is_finance: bool,
-    confidence: float,
-    method: str = "llm",
-):
-    engine = get_engine()
-    async with engine.connect() as conn:
-        await conn.execute(
-            text("""
-                INSERT INTO tbl_Sms_Classification (sms_id, sender, category, direction, is_finance, method, confidence, created_at)
-                VALUES (:sid, :sender, :category, :direction, :is_finance, :method, :confidence, NOW())
-                ON DUPLICATE KEY UPDATE
-                    sender = VALUES(sender),
-                    category = VALUES(category),
-                    direction = VALUES(direction),
-                    is_finance = VALUES(is_finance),
-                    method = VALUES(method),
-                    confidence = VALUES(confidence)
-            """),
-            {
-                "sid": sms_id,
-                "sender": sender,
                 "category": category,
-                "direction": direction,
                 "is_finance": 1 if is_finance else 0,
-                "method": method,
                 "confidence": confidence,
+                "method": method,
+                "trans_date": parsed_date,
             },
         )
         await conn.commit()
@@ -297,6 +245,183 @@ async def get_processed_sender_numbers(owner: str) -> set[str]:
         return {row[0] for row in result.fetchall()}
 
 
+async def get_allowed_senders() -> dict[str, Optional[str]]:
+    """Global "allowed by default" finance senders from tbl_Allowed_Senders.
+
+    Returns a map of upper-cased sender -> category. The caller falls back to
+    the hardcoded list when this table is empty (or on any DB error).
+    """
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT sender, category FROM tbl_Allowed_Senders")
+        )
+        return {row[0].upper(): row[1] for row in result.fetchall()}
+
+
+# ── Prompt version management ─────────────────────────────
+
+
+async def ensure_prompts_table():
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS tbl_LLM_Prompts (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    prompt_key VARCHAR(50) NOT NULL,
+                    version INT NOT NULL,
+                    title VARCHAR(255) NOT NULL DEFAULT '',
+                    body TEXT NOT NULL,
+                    is_active TINYINT(1) DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_key_version (prompt_key, version),
+                    KEY idx_key_active (prompt_key, is_active)
+                )
+            """)
+        )
+        await conn.commit()
+
+
+async def get_all_prompts() -> list[dict]:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT id, prompt_key, version, title, body, is_active, created_at
+                FROM tbl_LLM_Prompts
+                ORDER BY prompt_key ASC, version DESC
+            """)
+        )
+        return [dict(row._mapping) for row in result.fetchall()]
+
+
+async def get_active_prompt(key: str) -> Optional[str]:
+    """Return the body of the active prompt for a key, or None."""
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT body FROM tbl_LLM_Prompts
+                WHERE prompt_key = :k AND is_active = 1
+                ORDER BY version DESC LIMIT 1
+            """),
+            {"k": key},
+        )
+        row = result.fetchone()
+        return row[0] if row else None
+
+
+async def get_max_version(key: str) -> int:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT COALESCE(MAX(version), 0) FROM tbl_LLM_Prompts WHERE prompt_key = :k
+            """),
+            {"k": key},
+        )
+        return int(result.scalar_one())
+
+
+async def deactivate_prompts(key: str):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("UPDATE tbl_LLM_Prompts SET is_active = 0 WHERE prompt_key = :k"),
+            {"k": key},
+        )
+        await conn.commit()
+
+
+async def insert_prompt(key: str, title: str, body: str, version: int, is_active: int = 1) -> int:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                INSERT INTO tbl_LLM_Prompts (prompt_key, version, title, body, is_active, created_at)
+                VALUES (:k, :v, :t, :b, :a, NOW())
+            """),
+            {"k": key, "v": version, "t": title, "b": body, "a": is_active},
+        )
+        await conn.commit()
+        return result.lastrowid
+
+
+async def set_prompt_active(prompt_id: int, key: str):
+    await deactivate_prompts(key)
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("UPDATE tbl_LLM_Prompts SET is_active = 1 WHERE id = :id"),
+            {"id": prompt_id},
+        )
+        await conn.commit()
+
+
+async def delete_prompt(prompt_id: int):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("DELETE FROM tbl_LLM_Prompts WHERE id = :id"),
+            {"id": prompt_id},
+        )
+        await conn.commit()
+
+
+# ── Job controls (admin auto on/off) ───────────────────────
+
+
+async def ensure_controls_table():
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS tbl_ML_Controls (
+                    control_key VARCHAR(50) PRIMARY KEY,
+                    control_value VARCHAR(255) NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """)
+        )
+        await conn.commit()
+
+
+async def get_control(key: str, default: str = "") -> str:
+    try:
+        engine = get_engine()
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT control_value FROM tbl_ML_Controls WHERE control_key = :k"),
+                {"k": key},
+            )
+            row = result.fetchone()
+            return row[0] if row else default
+    except Exception as e:
+        logger.warning(f"Could not read control '{key}' ({e}); using default.")
+        return default
+
+
+async def set_control(key: str, value: str):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("""
+                INSERT INTO tbl_ML_Controls (control_key, control_value)
+                VALUES (:k, :v)
+                ON DUPLICATE KEY UPDATE control_value = VALUES(control_value)
+            """),
+            {"k": key, "v": value},
+        )
+        await conn.commit()
+
+
+async def is_auto_jobs_enabled() -> bool:
+    """Whether the background poller / auto jobs may run."""
+    value = await get_control("auto_jobs_enabled", "1")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 # ── User-triggered processing jobs ─────────────────────────
 
 
@@ -314,11 +439,22 @@ async def ensure_jobs_table():
                     duration_seconds INT NULL,
                     messages_processed INT DEFAULT 0,
                     errors INT DEFAULT 0,
+                    metadata JSON NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_user_status (user_id, status)
                 )
             """)
         )
+        # Add metadata column on legacy tables (MySQL 8: check before ALTER).
+        col = await conn.execute(
+            text("""
+                SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_Processing_Jobs'
+                  AND COLUMN_NAME = 'metadata'
+            """)
+        )
+        if col.scalar_one() == 0:
+            await conn.execute(text("ALTER TABLE tbl_Processing_Jobs ADD COLUMN metadata JSON NULL"))
         await conn.commit()
 
 
@@ -341,7 +477,10 @@ async def update_job(job_id: int, **kwargs):
     params: dict = {"id": job_id}
     for key, val in kwargs.items():
         sets.append(f"{key} = :{key}")
-        params[key] = val
+        if isinstance(val, (dict, list)):
+            params[key] = json.dumps(val)
+        else:
+            params[key] = val
     if not sets:
         return
     engine = get_engine()
@@ -351,6 +490,22 @@ async def update_job(job_id: int, **kwargs):
             params,
         )
         await conn.commit()
+
+
+async def fetch_jobs(limit: int = 100) -> list[dict]:
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT id, user_id, status, started_at, completed_at,
+                       duration_seconds, messages_processed, errors, metadata, created_at
+                FROM tbl_Processing_Jobs
+                ORDER BY id DESC
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        )
+        return [dict(row._mapping) for row in result.fetchall()]
 
 
 async def fetch_unprocessed_sms_by_owner(owner: str, batch_size: int) -> list[dict]:

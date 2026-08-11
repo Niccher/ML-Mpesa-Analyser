@@ -16,6 +16,12 @@ services:
       - LLM_MODEL=qwen2.5-1.5b-instruct
       - LLM_PROVIDER=openai-compatible
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9050/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     networks:
       - ${NETWORK_NAME:-hosts-shared-network}
 

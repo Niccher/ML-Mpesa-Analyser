@@ -3,15 +3,18 @@ set -e
 
 LLAMA_PORT=${LLAMA_PORT:-8080}
 MODEL_PATH=${MODEL_PATH:-/models/qwen2.5-1.5b-instruct-q4_k_m.gguf}
+LLM_CTX_SIZE=${LLM_CTX_SIZE:-16384}
+LLM_BATCH_SIZE=${LLM_BATCH_SIZE:-512}
+N_GPU_LAYERS=${N_GPU_LAYERS:-0}
 
 echo "Starting llama.cpp server on port ${LLAMA_PORT}..."
 llama-server \
     --model "${MODEL_PATH}" \
     --port "${LLAMA_PORT}" \
     --host 0.0.0.0 \
-    --ctx-size 16384 \
-    --batch-size 512 \
-    --n-gpu-layers 0 \
+    --ctx-size "${LLM_CTX_SIZE}" \
+    --batch-size "${LLM_BATCH_SIZE}" \
+    --n-gpu-layers "${N_GPU_LAYERS}" \
     --mlock \
     &
 
