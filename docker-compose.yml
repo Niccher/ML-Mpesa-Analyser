@@ -16,6 +16,8 @@ services:
       - LLM_MODEL=qwen2.5-1.5b-instruct
       - LLM_PROVIDER=openai-compatible
     restart: unless-stopped
+    volumes:
+      - ./app:/app/app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9050/health"]
       interval: 30s

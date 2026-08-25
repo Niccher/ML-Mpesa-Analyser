@@ -1,4 +1,47 @@
+# Version control & IDE
+.git
+.gitignore
+.idea/
+.vscode/
+*.iml
+
+# Environment & secrets — never bake into image layers
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python bytecode
 __pycache__/
 *.pyc
-.git/
-.env
+*.pyo
+*.pyd
+
+# Dev utilities (not part of the container)
+tests/
+README.md
+LICENSE
+seed_prompts.py
+
+# Logs
+logs/
+*.log
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# OS junk
+.DS_Store
+Thumbs.db
+._*
+
+# Docker spec files (not needed inside the image)
+Dockerfile
+docker-compose.yml
+.dockerignore

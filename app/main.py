@@ -14,13 +14,12 @@ from app.config import settings
 from app.db.connection import verify_connection, close_engine
 from app.db.queries import (
     create_job,
-    ensure_controls_table,
-    ensure_jobs_table,
-    ensure_prompts_table,
-    ensure_tracking_table,
+    ensure_all_tables,
     fetch_unprocessed_sms,
     fetch_unprocessed_sms_by_owner,
+    fetch_user_financial_aggregation,
     is_auto_jobs_enabled,
+    log_llm_call,
     mark_processing,
     update_job,
     upsert_sender_profile,
@@ -42,12 +41,22 @@ _running = True
 _processor_task: Optional[asyncio.Task] = None
 _processing_lock = asyncio.Lock()
 
+# Fix #4 — per-user lock so two simultaneous calls for the same user
+# don't double-process the same SMS rows.
+_user_locks: dict[str, asyncio.Lock] = {}
+
 
 # ── Core processing logic (shared by background & API) ────
 
 
-async def process_rows(rows: list[dict]) -> dict:
-    """Process a list of SMS rows (sender classification + extraction)."""
+async def process_rows(rows: list[dict], job_id: Optional[int] = None) -> dict:
+    """Process a list of SMS rows (sender classification + extraction).
+
+    Args:
+        rows:   SMS rows fetched from DB.
+        job_id: Optional tbl_Processing_Jobs id — passed through to log_llm_call
+                so every LLM API call is linked to the triggering job.
+    """
     if not rows:
         return {"senders_classified": 0, "messages_processed": 0, "finance_senders_found": 0, "transactional_inserted": 0, "errors": 0}
 
@@ -74,7 +83,22 @@ async def process_rows(rows: list[dict]) -> dict:
     for key, data in sender_map.items():
         classify_input[data["number"] or f"unknown_{key}"] = data["bodies"]
 
-    classifications = await SenderClassifier.classify_batch(classify_input)
+    # SenderClassifier.classify_batch returns classifications + per-call results
+    classifications, classify_call_results = await SenderClassifier.classify_batch(classify_input)
+
+    # Fix #3 — log every classify LLM call to the audit table
+    for cr in classify_call_results:
+        await log_llm_call(
+            call_type="classify",
+            model=cr.model,
+            provider=cr.provider,
+            latency_ms=cr.latency_ms,
+            batch_size=1,
+            status="fallback" if cr.used_fallback else "ok",
+            job_id=job_id,
+            prompt_tokens=cr.prompt_tokens,
+            reply_tokens=cr.reply_tokens,
+        )
 
     cls_by_number: dict[str, SenderClassification] = {}
     for cls in classifications:
@@ -182,7 +206,23 @@ async def process_rows(rows: list[dict]) -> dict:
             })
             continue
 
-        extractions = await MessageExtractor.extract_batch(data["bodies"])
+        # Fix #3 — extract_batch now returns (extractions, list[LLMCallResult])
+        extractions, extract_call_results = await MessageExtractor.extract_batch(data["bodies"])
+
+        # Log every extract LLM call to the audit table
+        for cr in extract_call_results:
+            await log_llm_call(
+                call_type="extract",
+                model=cr.model,
+                provider=cr.provider,
+                latency_ms=cr.latency_ms,
+                batch_size=len(data["bodies"]),
+                status="fallback" if cr.used_fallback else "ok",
+                job_id=job_id,
+                prompt_tokens=cr.prompt_tokens,
+                reply_tokens=cr.reply_tokens,
+            )
+
         for idx, extraction in enumerate(extractions):
             if idx >= len(data["rows"]):
                 break
@@ -199,11 +239,19 @@ async def process_rows(rows: list[dict]) -> dict:
                         counterparty=extraction.counterparty,
                         transaction_type=extraction.transaction_type.value if extraction.transaction_type else None,
                         is_transactional=extraction.is_transactional,
-                        category=category,
+                        category=extraction.category if extraction.category else category,
                         is_finance=cls.is_finance,
                         confidence=cls.confidence,
                         method="llm",
                         trans_date=extraction.transaction_time,
+                        fee=extraction.fee,
+                        is_reversal=extraction.is_reversal,
+                        is_loan=extraction.is_loan,
+                        counterparty_type=extraction.counterparty_type,
+                        is_abnormal=extraction.is_abnormal,
+                        normality_assessment=extraction.normality_assessment,
+                        savings_impact=extraction.savings_impact,
+                        advisor_insight=extraction.advisor_insight,
                     )
                     if extraction.is_transactional and extraction.amount_changed:
                         transactional_inserted += 1
@@ -253,8 +301,9 @@ async def run_processing() -> dict:
     # Refresh the allowed-senders lookup (DB first, hardcoded fallback).
     await SenderClassifier.reload_allowed()
 
-    await ensure_tracking_table()
-    rows = await fetch_unprocessed_sms(settings.batch_size)
+    await ensure_all_tables()
+    batch_size = settings.external_batch_size if settings.llm_engine == "external" else settings.batch_size
+    rows = await fetch_unprocessed_sms(batch_size)
     return await process_rows(rows)
 
 
@@ -285,7 +334,8 @@ async def poll_loop():
         except Exception as e:
             logger.error(f"Poll cycle error: {e}")
 
-        for _ in range(settings.poll_interval):
+        poll_interval = settings.external_poll_interval if settings.llm_engine == "external" else settings.poll_interval
+        for _ in range(poll_interval):
             if not _running:
                 break
             await asyncio.sleep(1)
@@ -297,19 +347,20 @@ async def poll_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _processor_task
+    # Ensure the prompt-versioning and controls tables exist first
+    try:
+        if await verify_connection():
+            await ensure_all_tables()
+            # Dynamic settings hot-reload from database
+            await settings.reload_from_db()
+    except Exception as e:
+        logger.warning(f"Could not ensure ML tables or load configs at startup: {e}")
+
     logger.info(f"Starting SMS Finance LLM service — polling every {settings.poll_interval}s")
     _processor_task = asyncio.create_task(poll_loop())
     # Prime the allowed-senders lookup once at startup.
     await SenderClassifier.reload_allowed()
-    # Ensure the prompt-versioning table exists (hardcoded prompts remain the
-    # fallback until an admin saves a DB version).
-    try:
-        if await verify_connection():
-            await ensure_prompts_table()
-            await ensure_controls_table()
-            await ensure_jobs_table()
-    except Exception as e:
-        logger.warning(f"Could not ensure prompts/controls/jobs tables: {e}")
+
     yield
     logger.info("Shutting down...")
     _running = False
@@ -323,13 +374,19 @@ async def lifespan(app: FastAPI):
     await close_engine()
 
 
+
 def _job_metadata(user_id: str, result: dict, status: str, duration: int, error: str = "") -> dict:
     """Build a rich metadata payload for a processing job."""
-    return {
+    is_external = settings.llm_engine == "external"
+
+    # Common fields always present
+    meta: dict = {
         "user_id": user_id,
         "status": status,
         "duration_seconds": duration,
         "error": error or None,
+        # Engine marker — key field for the UI to branch on
+        "llm_engine": settings.llm_engine,
         # Sender breakdown
         "senders_total": result.get("senders_total", 0),
         "senders_finance": result.get("senders_finance", 0),
@@ -342,23 +399,46 @@ def _job_metadata(user_id: str, result: dict, status: str, duration: int, error:
         "messages_processed": result.get("messages_processed", 0),
         "transactional_inserted": result.get("transactional_inserted", 0),
         "errors": result.get("errors", 0),
-        # Model / backend context
-        "model": settings.llm_model,
-        "model_provider": settings.llm_provider,
-        "model_path": os.getenv("MODEL_PATH", ""),
-        "llm_max_tokens": settings.llm_max_tokens,
-        "llm_temperature": settings.llm_temperature,
-        "llm_ctx_size": settings.llm_ctx_size,
-        "llm_batch_size": settings.llm_batch_size,
-        "n_gpu_layers": settings.n_gpu_layers,
-        "sms_batch_size": settings.batch_size,
-        "max_retries": settings.max_retries,
-        "poll_interval": settings.poll_interval,
         # Per-sender / category / direction detail
         "senders_detail": result.get("senders_detail", []),
         "category_counts": result.get("category_counts", {}),
         "direction_counts": result.get("direction_counts", {}),
     }
+
+    if is_external:
+        # External engine fields
+        meta.update({
+            "model": settings.llm_external_model,
+            "model_provider": settings.llm_external_provider,
+            "model_base_url": settings.llm_external_base_url,
+            "llm_max_tokens": settings.llm_external_max_tokens,
+            "llm_temperature": settings.llm_external_temperature,
+            "sms_batch_size": settings.external_batch_size,
+            "max_retries": settings.external_max_retries,
+            "poll_interval": settings.external_poll_interval,
+            # Fallback info
+            "fallback_enabled": settings.llm_fallback_enabled,
+            "fallback_provider": settings.llm_fallback_provider if settings.llm_fallback_enabled else None,
+            "fallback_model": settings.llm_fallback_model if settings.llm_fallback_enabled else None,
+        })
+    else:
+        # Local engine fields
+        meta.update({
+            "model": settings.llm_model,
+            "model_provider": settings.llm_provider,
+            "model_path": os.getenv("MODEL_PATH", ""),
+            "model_base_url": settings.llm_base_url,
+            "llm_max_tokens": settings.llm_max_tokens,
+            "llm_temperature": settings.llm_temperature,
+            "llm_ctx_size": settings.llm_ctx_size,
+            "llm_batch_size": settings.llm_batch_size,
+            "n_gpu_layers": settings.n_gpu_layers,
+            "sms_batch_size": settings.batch_size,
+            "max_retries": settings.max_retries,
+            "poll_interval": settings.poll_interval,
+        })
+
+    return meta
 
 
 app = FastAPI(
@@ -408,18 +488,60 @@ async def process_db():
 
 
 @app.post("/process/for-user/{user_id}", response_model=ProcessingJobResponse)
-async def process_for_user(user_id: str):
-    """Process unprocessed SMS for a specific user.
+async def process_for_user(user_id: str, job_id: Optional[int] = None):
+    """Trigger LLM processing for a user — returns immediately with a job_id.
 
-    The PHP webapp inserts a row into tbl_Processing_Jobs with
-    status='queued' before calling this endpoint. This endpoint
-    picks it up, runs the LLM pipeline, and marks it done.
+    If a job is already running for this user, this request will pre-empt/kill
+    it in the database. The running job's background thread will detect the status
+    change, exit cleanly, release the lock, and allow the new job to run.
     """
-    await ensure_tracking_table()
-    await ensure_jobs_table()
+    # Fix #5 — startup ensure_all_tables() covers table creation.
+
+    user_lock = _user_locks.setdefault(user_id, asyncio.Lock())
+    if user_lock.locked():
+        # Preempt the running job: find the active job and mark it as 'failed' (preempted)
+        active_job_id = 0
+        try:
+            from app.db.connection import get_engine as _ge
+            from sqlalchemy import text as _text
+            engine = _ge()
+            async with engine.connect() as conn:
+                row = await conn.execute(
+                    _text("SELECT id FROM tbl_Processing_Jobs WHERE user_id=:u AND status IN ('queued','starting','processing') ORDER BY id DESC LIMIT 1"),
+                    {"u": user_id},
+                )
+                r = row.fetchone()
+                if r:
+                    active_job_id = r[0]
+                    # Update its status to 'failed' so the loop knows to stop
+                    await conn.execute(
+                        _text("UPDATE tbl_Processing_Jobs SET status='failed', completed_at=NOW(), metadata=JSON_SET(COALESCE(metadata, '{}'), '$.error', 'Preempted by a new job run.') WHERE id=:id"),
+                        {"id": active_job_id}
+                    )
+                    await conn.commit()
+                    logger.info(f"Preempted existing active job {active_job_id} for user {user_id}.")
+        except Exception as e:
+            logger.warning(f"Failed to preempt active job: {e}")
+
+        # Wait briefly for the lock to release (up to 3 seconds)
+        for _ in range(30):
+            if not user_lock.locked():
+                break
+            await asyncio.sleep(0.1)
+
+        # If it's still locked, return already_running
+        if user_lock.locked():
+            return ProcessingJobResponse(
+                job_id=active_job_id or job_id or 0,
+                user_id=user_id,
+                status="already_running",
+                started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
 
     if not await is_auto_jobs_enabled():
-        job_id = await create_job(user_id)
+        if job_id is None:
+            job_id = await create_job(user_id)
         await update_job(job_id, status="disabled", completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         return ProcessingJobResponse(
             job_id=job_id, user_id=user_id, status="disabled",
@@ -427,61 +549,195 @@ async def process_for_user(user_id: str):
             completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
-    job_id = await create_job(user_id)
+    # Create job record immediately so the caller has an id to poll
+    if job_id is None:
+        job_id = await create_job(user_id)
     await update_job(job_id, status="starting", started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    start = datetime.now()
 
-    rows = await fetch_unprocessed_sms_by_owner(user_id, settings.batch_size)
-    if not rows:
-        elapsed = int((datetime.now() - start).total_seconds())
-        meta = _job_metadata(user_id, {"sms_total": 0}, status="done", duration=elapsed)
-        await update_job(
-            job_id,
-            status="done",
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            duration_seconds=elapsed,
-            messages_processed=0,
-            errors=0,
-            metadata=meta,
-        )
-        return ProcessingJobResponse(
-            job_id=job_id, user_id=user_id, status="done",
-            messages_processed=0, errors=0, duration_seconds=elapsed,
-            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
+    # Spawn the actual work as a detached background task.
+    # The HTTP response is sent NOW; the task runs independently.
+    asyncio.ensure_future(_run_user_job(user_id, job_id, user_lock))
 
-    try:
-        result = await process_rows(rows)
-        elapsed = int((datetime.now() - start).total_seconds())
-        meta = _job_metadata(user_id, result, status="done", duration=elapsed)
-        await update_job(
-            job_id,
-            status="done",
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            duration_seconds=elapsed,
-            messages_processed=result["messages_processed"],
-            errors=result["errors"],
-            metadata=meta,
-        )
-        return ProcessingJobResponse(
-            job_id=job_id,
-            user_id=user_id,
-            status="done",
-            messages_processed=result["messages_processed"],
-            errors=result["errors"],
-            duration_seconds=elapsed,
-            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-    except Exception as e:
-        elapsed = int((datetime.now() - start).total_seconds())
-        meta = _job_metadata(user_id, {}, status="error", duration=elapsed, error=str(e)[:500])
-        await update_job(job_id, status="error", completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), duration_seconds=elapsed, metadata=meta)
-        logger.error(f"User processing failed for {user_id}: {e}")
-        return ProcessingJobResponse(
-            job_id=job_id, user_id=user_id, status="error",
-            duration_seconds=elapsed,
-            started_at=start.strftime("%Y-%m-%d %H:%M:%S"),
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
+    return ProcessingJobResponse(
+        job_id=job_id,
+        user_id=user_id,
+        status="starting",
+        started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+
+async def _run_user_job(user_id: str, job_id: int, user_lock: asyncio.Lock):
+    """Background task: run the full batch loop for a user.
+
+    Acquires the per-user lock, processes all unprocessed SMS in batches,
+    updates progress checkpoints, and releases the lock when done.
+    Checks the database before every batch; if the job status has been set
+    to 'failed' or 'cancelled' externally, it terminates immediately.
+    Always releases the lock — even on exception — so future requests aren't blocked.
+    """
+    # Dynamic settings hot-reload from database (contains engine config selection)
+    await settings.reload_from_db()
+
+    async with user_lock:
+        start = datetime.now()
+        batch_size = settings.external_batch_size if settings.llm_engine == "external" else settings.batch_size
+
+        total_messages_processed = 0
+        total_errors = 0
+        total_senders = 0
+        total_senders_finance = 0
+        total_senders_unwanted = 0
+        total_sms = 0
+        total_sms_finance = 0
+        total_sms_unwanted = 0
+        total_sms_skipped = 0
+        total_transactional_inserted = 0
+        combined_senders_detail: list[dict] = []
+        combined_category_counts: dict[str, int] = {}
+        combined_direction_counts: dict[str, int] = {"incoming": 0, "outgoing": 0, "none": 0}
+        iterations = 0
+
+        engine = None
+        try:
+            from app.db.connection import get_engine as _ge
+            from sqlalchemy import text as _text
+            engine = _ge()
+        except Exception:
+            pass
+
+        try:
+            while True:
+                # Check database status: stop immediately if cancelled/stopped by admin
+                if engine:
+                    try:
+                        async with engine.connect() as conn:
+                            check = await conn.execute(
+                                _text("SELECT status FROM tbl_Processing_Jobs WHERE id = :id"),
+                                {"id": job_id}
+                            )
+                            row = check.fetchone()
+                            if row and row[0] in ('failed', 'cancelled'):
+                                logger.info(f"Job {job_id} cancelled externally. Stopping processing loop.")
+                                return
+                    except Exception as e:
+                        logger.warning(f"Could not verify job status in loop: {e}")
+
+                if engine:
+                    try:
+                        async with engine.connect() as conn:
+                            user_id_int = int(user_id) if (user_id or "").isdigit() else -1
+                            if user_id_int != -1:
+                                await conn.execute(
+                                    _text("""
+                                        INSERT INTO tbl_Sms_Processing (sms_id, status, attempt_count, last_error, processed_at)
+                                        SELECT s.id, 'skipped', 1, 'Blocked Sender', NOW()
+                                        FROM tbl_Sms s
+                                        LEFT JOIN tbl_Sms_Processing p ON p.sms_id = s.id
+                                        INNER JOIN tbl_Blocked_Senders bs ON UPPER(TRIM(bs.sender)) = UPPER(TRIM(s.sms_number)) AND bs.user_id = :user_id
+                                        WHERE p.sms_id IS NULL
+                                          AND s.sms_owner IN (
+                                            SELECT DISTINCT s2.sms_owner 
+                                            FROM tbl_Sms s2
+                                            INNER JOIN auth_identities i ON i.secret = SHA2(s2.sms_owner, 256)
+                                            WHERE i.user_id = :user_id AND i.type = 'access_token'
+                                          )
+                                    """),
+                                    {"user_id": user_id_int}
+                                )
+                                await conn.commit()
+                    except Exception as e:
+                        logger.warning(f"Could not auto-skip blocked senders in loop: {e}")
+
+                rows = await fetch_unprocessed_sms_by_owner(user_id, batch_size)
+                if not rows:
+                    break
+
+                iterations += 1
+
+                current_senders = list(set(row["sms_number"] for row in rows if row.get("sms_number")))
+                # Fix #2 — progressive checkpoint with running totals
+                await update_job(
+                    job_id,
+                    status="processing",
+                    messages_processed=total_messages_processed,
+                    errors=total_errors,
+                    metadata={
+                        "iteration": iterations,
+                        "sms_done_so_far": total_messages_processed,
+                        "last_batch_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "llm_engine": settings.llm_engine,
+                        "model": settings.llm_external_model if settings.llm_engine == "external" else settings.llm_model,
+                        "model_provider": settings.llm_external_provider if settings.llm_engine == "external" else settings.llm_provider,
+                        "current_senders": current_senders,
+                    },
+                )
+
+                res = await process_rows(rows, job_id=job_id)
+
+                total_messages_processed += res.get("messages_processed", 0)
+                total_errors            += res.get("errors", 0)
+                total_senders           += res.get("senders_total", 0)
+                total_senders_finance   += res.get("senders_finance", 0)
+                total_senders_unwanted  += res.get("senders_unwanted", 0)
+                total_sms               += res.get("sms_total", 0)
+                total_sms_finance       += res.get("sms_finance", 0)
+                total_sms_unwanted      += res.get("sms_unwanted", 0)
+                total_sms_skipped       += res.get("sms_skipped", 0)
+                total_transactional_inserted += res.get("transactional_inserted", 0)
+
+                if isinstance(res.get("senders_detail"), list):
+                    combined_senders_detail.extend(res["senders_detail"])
+                for cat, cnt in res.get("category_counts", {}).items():
+                    combined_category_counts[cat] = combined_category_counts.get(cat, 0) + cnt
+                for dir_k, cnt in res.get("direction_counts", {}).items():
+                    combined_direction_counts[dir_k] = combined_direction_counts.get(dir_k, 0) + cnt
+
+            elapsed = int((datetime.now() - start).total_seconds())
+            financial_agg = await fetch_user_financial_aggregation(user_id)
+            speed = round(total_messages_processed / max(1, elapsed), 1)
+
+            combined_result = {
+                "senders_total": total_senders, "senders_finance": total_senders_finance,
+                "senders_unwanted": total_senders_unwanted, "sms_total": total_sms,
+                "sms_finance": total_sms_finance, "sms_unwanted": total_sms_unwanted,
+                "sms_skipped": total_sms_skipped, "messages_processed": total_messages_processed,
+                "transactional_inserted": total_transactional_inserted, "errors": total_errors,
+                "senders_detail": combined_senders_detail,
+                "category_counts": combined_category_counts,
+                "direction_counts": combined_direction_counts,
+            }
+
+            meta = _job_metadata(user_id, combined_result, status="done", duration=elapsed)
+            meta["processing_rate_sms_per_sec"] = speed
+            meta["iterations"] = iterations
+            meta["aggregation"] = financial_agg
+
+            await update_job(
+                job_id,
+                status="done",
+                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                duration_seconds=elapsed,
+                messages_processed=total_messages_processed,
+                errors=total_errors,
+                metadata=meta,
+            )
+            logger.info(f"Job {job_id} for user {user_id} completed: {total_messages_processed} messages, {total_errors} errors, {elapsed}s")
+
+        except Exception as e:
+            elapsed = int((datetime.now() - start).total_seconds())
+            meta = _job_metadata(user_id, {}, status="error", duration=elapsed, error=str(e)[:500])
+            try:
+                await update_job(job_id, status="error",
+                                 completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 duration_seconds=elapsed, metadata=meta)
+            except Exception:
+                pass
+            logger.error(f"Job {job_id} for user {user_id} failed: {e}")
+
+
+
+
+
+

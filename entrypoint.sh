@@ -36,4 +36,4 @@ if ! kill -0 "${LLAMA_PID}" 2>/dev/null; then
 fi
 
 echo "Starting FastAPI app on port 9050..."
-exec uvicorn app.main:app --host 0.0.0.0 --port 9050
+exec uvicorn app.main:app --host 0.0.0.0 --port 9050 --reload

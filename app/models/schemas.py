@@ -58,10 +58,19 @@ class MessageExtraction(BaseModel):
     amount_after: Optional[float] = None
     amount_changed: Optional[float] = None
     direction: Direction
+    fee: Optional[float] = None
+    is_reversal: bool = False
+    is_loan: bool = False
     transaction_time: Optional[str] = None
     counterparty: Optional[str] = None
     transaction_reference: Optional[str] = None
     transaction_type: TransactionType = TransactionType.unknown
+    category: Optional[str] = None
+    counterparty_type: Optional[str] = None
+    is_abnormal: bool = False
+    normality_assessment: Optional[str] = None
+    savings_impact: Optional[str] = None
+    advisor_insight: Optional[str] = None
 
 
 # ── Mode A (API) I/O ───────────────────────────────────────

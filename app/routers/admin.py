@@ -39,6 +39,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 class ConfigUpdate(BaseModel):
+    llm_engine: Optional[str] = None
     llm_model: Optional[str] = None
     llm_max_tokens: Optional[int] = Field(default=None, ge=256, le=8192)
     llm_temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -48,6 +49,33 @@ class ConfigUpdate(BaseModel):
     batch_size: Optional[int] = Field(default=None, ge=1, le=500)
     max_retries: Optional[int] = Field(default=None, ge=0, le=10)
     poll_interval: Optional[int] = Field(default=None, ge=5, le=3600)
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_base_url: Optional[str] = None
+    llm_external_provider: Optional[str] = None
+    llm_external_api_key: Optional[str] = None
+    llm_external_base_url: Optional[str] = None
+    llm_external_model: Optional[str] = None
+    llm_external_max_tokens: Optional[int] = Field(default=None, ge=256, le=8192)
+    llm_external_temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    external_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
+    external_max_retries: Optional[int] = Field(default=None, ge=0, le=10)
+    external_poll_interval: Optional[int] = Field(default=None, ge=5, le=3600)
+    llm_fallback_provider: Optional[str] = None
+    llm_fallback_api_key: Optional[str] = None
+    llm_fallback_base_url: Optional[str] = None
+    llm_fallback_model: Optional[str] = None
+    llm_fallback_enabled: Optional[bool] = None
+    llm_gemini_api_key: Optional[str] = None
+    llm_deepseek_api_key: Optional[str] = None
+    llm_openai_api_key: Optional[str] = None
+    llm_groq_api_key: Optional[str] = None
+    llm_mistral_api_key: Optional[str] = None
+    llm_openrouter_api_key: Optional[str] = None
+    llm_cohere_api_key: Optional[str] = None
+    llm_kimi_api_key: Optional[str] = None
+    llm_nemotron_api_key: Optional[str] = None
+    llm_xai_api_key: Optional[str] = None
 
 
 class ModelActivate(BaseModel):
@@ -99,6 +127,7 @@ async def status():
         "status": "ok",
         "auto_jobs_enabled": auto_enabled,
         "app": {
+            "llm_engine": settings.llm_engine,
             "llm_provider": settings.llm_provider,
             "llm_model": settings.llm_model,
             "llm_max_tokens": settings.llm_max_tokens,
@@ -111,6 +140,30 @@ async def status():
             "max_retries": settings.max_retries,
             "poll_interval": settings.poll_interval,
             "model_path": os.getenv("MODEL_PATH", ""),
+            "llm_external_provider": settings.llm_external_provider,
+            "llm_external_api_key": settings.llm_external_api_key,
+            "llm_external_base_url": settings.llm_external_base_url,
+            "llm_external_model": settings.llm_external_model,
+            "llm_external_max_tokens": settings.llm_external_max_tokens,
+            "llm_external_temperature": settings.llm_external_temperature,
+            "external_batch_size": settings.external_batch_size,
+            "external_max_retries": settings.external_max_retries,
+            "external_poll_interval": settings.external_poll_interval,
+            "llm_fallback_provider": settings.llm_fallback_provider,
+            "llm_fallback_api_key": settings.llm_fallback_api_key,
+            "llm_fallback_base_url": settings.llm_fallback_base_url,
+            "llm_fallback_model": settings.llm_fallback_model,
+            "llm_fallback_enabled": settings.llm_fallback_enabled,
+            "llm_gemini_api_key": settings.llm_gemini_api_key,
+            "llm_deepseek_api_key": settings.llm_deepseek_api_key,
+            "llm_openai_api_key": settings.llm_openai_api_key,
+            "llm_groq_api_key": settings.llm_groq_api_key,
+            "llm_mistral_api_key": settings.llm_mistral_api_key,
+            "llm_openrouter_api_key": settings.llm_openrouter_api_key,
+            "llm_cohere_api_key": settings.llm_cohere_api_key,
+            "llm_kimi_api_key": settings.llm_kimi_api_key,
+            "llm_nemotron_api_key": settings.llm_nemotron_api_key,
+            "llm_xai_api_key": settings.llm_xai_api_key,
         },
         "llama": llama_status,
         "db_configured": db_ok,
@@ -129,39 +182,211 @@ async def list_models():
 
 @router.post("/config")
 async def update_config(payload: ConfigUpdate):
-    """Update in-memory config. Note: llama.cpp restart is required for model changes."""
+    """Update in-memory config and persist to both database controls and env file.
+
+    Database takes precedence on hot-reload. llama.cpp restart is required for GGUF model paths.
+    """
     env_path = os.getenv("ENV_FILE", "/app/.env")
     changes: list[str] = []
 
-    def apply(key: str, value) -> None:
+    async def apply(key: str, value) -> None:
         setattr(settings, key, value)
-        _set_env(key, value, env_path)
+        _set_env(key, str(value), env_path)
+        try:
+            await set_control(key, str(value))
+        except Exception as e:
+            logger.warning(f"Failed to persist control '{key}' to DB: {e}")
         changes.append(f"{key}={value}")
 
+    if payload.llm_engine is not None:
+        await apply("llm_engine", payload.llm_engine)
     if payload.llm_model is not None:
-        apply("llm_model", payload.llm_model)
+        await apply("llm_model", payload.llm_model)
     if payload.llm_max_tokens is not None:
-        apply("llm_max_tokens", payload.llm_max_tokens)
+        await apply("llm_max_tokens", payload.llm_max_tokens)
     if payload.llm_temperature is not None:
-        apply("llm_temperature", payload.llm_temperature)
+        await apply("llm_temperature", payload.llm_temperature)
     if payload.llm_ctx_size is not None:
-        apply("llm_ctx_size", payload.llm_ctx_size)
+        await apply("llm_ctx_size", payload.llm_ctx_size)
     if payload.llm_batch_size is not None:
-        apply("llm_batch_size", payload.llm_batch_size)
+        await apply("llm_batch_size", payload.llm_batch_size)
     if payload.n_gpu_layers is not None:
-        apply("n_gpu_layers", payload.n_gpu_layers)
+        await apply("n_gpu_layers", payload.n_gpu_layers)
     if payload.batch_size is not None:
-        apply("batch_size", payload.batch_size)
+        await apply("batch_size", payload.batch_size)
     if payload.max_retries is not None:
-        apply("max_retries", payload.max_retries)
+        await apply("max_retries", payload.max_retries)
     if payload.poll_interval is not None:
-        apply("poll_interval", payload.poll_interval)
+        await apply("poll_interval", payload.poll_interval)
+    if payload.llm_provider is not None:
+        await apply("llm_provider", payload.llm_provider)
+    if payload.llm_api_key is not None:
+        await apply("llm_api_key", payload.llm_api_key)
+    if payload.llm_base_url is not None:
+        await apply("llm_base_url", payload.llm_base_url)
+    if payload.llm_external_provider is not None:
+        await apply("llm_external_provider", payload.llm_external_provider)
+    if payload.llm_external_api_key is not None:
+        await apply("llm_external_api_key", payload.llm_external_api_key)
+    if payload.llm_external_base_url is not None:
+        await apply("llm_external_base_url", payload.llm_external_base_url)
+    if payload.llm_external_model is not None:
+        await apply("llm_external_model", payload.llm_external_model)
+    if payload.llm_external_max_tokens is not None:
+        await apply("llm_external_max_tokens", payload.llm_external_max_tokens)
+    if payload.llm_external_temperature is not None:
+        await apply("llm_external_temperature", payload.llm_external_temperature)
+    if payload.external_batch_size is not None:
+        await apply("external_batch_size", payload.external_batch_size)
+    if payload.external_max_retries is not None:
+        await apply("external_max_retries", payload.external_max_retries)
+    if payload.external_poll_interval is not None:
+        await apply("external_poll_interval", payload.external_poll_interval)
+    if payload.llm_fallback_provider is not None:
+        await apply("llm_fallback_provider", payload.llm_fallback_provider)
+    if payload.llm_fallback_api_key is not None:
+        await apply("llm_fallback_api_key", payload.llm_fallback_api_key)
+    if payload.llm_fallback_base_url is not None:
+        await apply("llm_fallback_base_url", payload.llm_fallback_base_url)
+    if payload.llm_fallback_model is not None:
+        await apply("llm_fallback_model", payload.llm_fallback_model)
+    if payload.llm_fallback_enabled is not None:
+        await apply("llm_fallback_enabled", payload.llm_fallback_enabled)
+    if payload.llm_gemini_api_key is not None:
+        await apply("llm_gemini_api_key", payload.llm_gemini_api_key)
+    if payload.llm_deepseek_api_key is not None:
+        await apply("llm_deepseek_api_key", payload.llm_deepseek_api_key)
+    if payload.llm_openai_api_key is not None:
+        await apply("llm_openai_api_key", payload.llm_openai_api_key)
+    if payload.llm_groq_api_key is not None:
+        await apply("llm_groq_api_key", payload.llm_groq_api_key)
+    if payload.llm_mistral_api_key is not None:
+        await apply("llm_mistral_api_key", payload.llm_mistral_api_key)
+    if payload.llm_openrouter_api_key is not None:
+        await apply("llm_openrouter_api_key", payload.llm_openrouter_api_key)
+    if payload.llm_cohere_api_key is not None:
+        await apply("llm_cohere_api_key", payload.llm_cohere_api_key)
+    if payload.llm_kimi_api_key is not None:
+        await apply("llm_kimi_api_key", payload.llm_kimi_api_key)
+    if payload.llm_nemotron_api_key is not None:
+        await apply("llm_nemotron_api_key", payload.llm_nemotron_api_key)
+    if payload.llm_xai_api_key is not None:
+        await apply("llm_xai_api_key", payload.llm_xai_api_key)
 
     return {
         "status": "ok",
         "applied": changes,
-        "note": "Restart llama.cpp for model changes to take effect.",
+        "note": "Config saved to DB and env. Restart llama.cpp for local model path changes.",
     }
+class ConnectionTest(BaseModel):
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+
+
+@router.post("/test_connection")
+async def test_connection(payload: ConnectionTest):
+    """Test connection to an external LLM provider endpoint.
+
+    Provider-aware: Gemini uses its native generateContent API,
+    Cohere uses its own chat endpoint; all others use OpenAI-compat
+    /chat/completions with Bearer auth.
+    """
+    import httpx
+
+    provider = (payload.provider or "").lower().strip()
+    api_key  = payload.api_key.strip()
+    model    = payload.model.strip()
+    base_url = payload.base_url.rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+
+            # ── Google Gemini (native REST) ────────────────────────────────
+            if provider == "gemini":
+                # Use the native generateContent endpoint — avoids the strict
+                # rate limits imposed on the OpenAI-compat shim.
+                gem_model = model if model else "gemini-1.5-flash"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{gem_model}:generateContent"
+                resp = await client.post(
+                    url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-goog-api-key": api_key,
+                    },
+                    json={"contents": [{"parts": [{"text": "ping"}]}]},
+                )
+                resp.raise_for_status()
+                res = resp.json()
+                if "candidates" in res and len(res["candidates"]) > 0:
+                    return {"status": "success", "message": "Connection successful! Gemini responded."}
+                return {"status": "error", "message": f"Unexpected Gemini response: {res}"}
+
+            # ── Cohere ─────────────────────────────────────────────────────
+            if provider == "cohere":
+                url = "https://api.cohere.com/v2/chat"
+                resp = await client.post(
+                    url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    json={
+                        "model": model or "command-r-plus",
+                        "messages": [{"role": "user", "content": "ping"}],
+                    },
+                )
+                resp.raise_for_status()
+                res = resp.json()
+                if "message" in res or "text" in res:
+                    return {"status": "success", "message": "Connection successful! Cohere responded."}
+                return {"status": "error", "message": f"Unexpected Cohere response: {res}"}
+
+            # ── All OpenAI-compat providers ────────────────────────────────
+            # (DeepSeek, OpenAI, Groq, Mistral, OpenRouter, Kimi, NVIDIA, x.ai, custom)
+            url = f"{base_url}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            # Kimi requires a special origin header
+            if provider == "kimi":
+                headers["HTTP-Referer"] = "https://mpesa-analyzer.local"
+
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 5,
+                "temperature": 0.0,
+            }
+            resp = await client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+            res = resp.json()
+            if "choices" in res and len(res["choices"]) > 0:
+                return {"status": "success", "message": "Connection successful!"}
+            return {"status": "error", "message": f"Invalid API response format: {res}"}
+
+    except httpx.HTTPStatusError as e:
+        status_code = e.response.status_code
+        hints = {
+            401: "Invalid or missing API key.",
+            403: "API key lacks permission for this model/endpoint.",
+            404: "Model or endpoint not found. Check the model name and base URL.",
+            422: "Request rejected by the API — check model name and parameters.",
+            429: "Rate limit hit. Wait a moment and try again, or check your quota.",
+            500: "Provider internal error. Try again later.",
+            503: "Provider overloaded or unavailable. Try again later.",
+        }
+        hint = hints.get(status_code, "")
+        msg = f"HTTP {status_code}"
+        if hint:
+            msg += f" — {hint}"
+        return {"status": "error", "message": f"Connection Failed\n{msg}"}
+    except httpx.TimeoutException:
+        return {"status": "error", "message": "Connection timed out (>20s). Check the base URL and your network."}
+    except Exception as e:
+        return {"status": "error", "message": f"Connection failed: {str(e)}"}
 
 
 @router.post("/models/activate")

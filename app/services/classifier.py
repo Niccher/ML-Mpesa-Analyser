@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
 from app.db.queries import get_allowed_senders
 from app.models.schemas import FinanceCategory, SenderClassification
-from app.services.llm_service import llm
+from app.services.llm_service import LLMCallResult, llm
 from app.utils.prompt_templates import FINANCE_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,14 @@ class SenderClassifier:
     @classmethod
     async def classify(
         cls, sender: str, sms_messages: list[str]
-    ) -> SenderClassification:
+    ) -> tuple[SenderClassification, Optional[LLMCallResult]]:
+        """Classify one sender.
+
+        Returns:
+            (SenderClassification, LLMCallResult | None)
+            LLMCallResult is None when the sender was resolved from the
+            known-finance list without an LLM call.
+        """
         sender_upper = sender.upper().strip()
 
         # If sender is in the allowed list (DB or hardcoded fallback), return
@@ -55,50 +63,75 @@ class SenderClassifier:
         # runs for finance senders downstream.
         if sender_upper in cls.KNOWN_FINANCE:
             cat = cls.KNOWN_FINANCE[sender_upper]
-            return SenderClassification(
-                sender=sender,
-                is_finance=True,
-                confidence=0.95,
-                category=cat,
-                reasoning=f"Known {cat.value} sender.",
+            return (
+                SenderClassification(
+                    sender=sender,
+                    is_finance=True,
+                    confidence=0.95,
+                    category=cat,
+                    reasoning=f"Known {cat.value} sender.",
+                ),
+                None,  # no LLM call made
             )
 
         # No SMS content to classify
         if not sms_messages:
-            return SenderClassification(
-                sender=sender,
-                is_finance=False,
-                confidence=0.0,
-                category=FinanceCategory.non_finance,
-                reasoning="No SMS content to analyze.",
+            return (
+                SenderClassification(
+                    sender=sender,
+                    is_finance=False,
+                    confidence=0.0,
+                    category=FinanceCategory.non_finance,
+                    reasoning="No SMS content to analyze.",
+                ),
+                None,
             )
 
         # Use LLM for classification
         try:
-            result = await llm.classify_sender(sender, sms_messages)
-            return SenderClassification(
-                sender=result.get("sender", sender),
-                is_finance=bool(result.get("is_finance", False)),
-                confidence=float(result.get("confidence", 0.0)),
-                category=FinanceCategory(result.get("category", "Non-Finance")),
-                reasoning=result.get("reasoning", ""),
+            result, call_result = await llm.classify_sender(sender, sms_messages)
+            return (
+                SenderClassification(
+                    sender=result.get("sender", sender),
+                    is_finance=bool(result.get("is_finance", False)),
+                    confidence=float(result.get("confidence", 0.0)),
+                    category=FinanceCategory(result.get("category", "Non-Finance")),
+                    reasoning=result.get("reasoning", ""),
+                ),
+                call_result,
             )
         except Exception as e:
             logger.error(f"LLM classification failed for {sender}: {e}")
-            return SenderClassification(
-                sender=sender,
-                is_finance=False,
-                confidence=0.0,
-                category=FinanceCategory.non_finance,
-                reasoning=f"Classification error: {e}",
+            return (
+                SenderClassification(
+                    sender=sender,
+                    is_finance=False,
+                    confidence=0.0,
+                    category=FinanceCategory.non_finance,
+                    reasoning=f"Classification error: {e}",
+                ),
+                None,
             )
 
     @classmethod
     async def classify_batch(
         cls, sender_map: dict[str, list[str]]
-    ) -> list[SenderClassification]:
-        results: list[SenderClassification] = []
-        for sender, messages in sender_map.items():
-            result = await cls.classify(sender, messages)
-            results.append(result)
-        return results
+    ) -> tuple[list[SenderClassification], list[LLMCallResult]]:
+        """Classify all senders.
+
+        Returns:
+            (classifications, call_results)
+            call_results only contains entries for senders that required an
+            LLM call (known-finance senders are resolved without a call).
+        """
+        tasks = [cls.classify(sender, messages) for sender, messages in sender_map.items()]
+        results = await asyncio.gather(*tasks)
+
+        classifications: list[SenderClassification] = []
+        call_results: list[LLMCallResult] = []
+        for classification, call_result in results:
+            classifications.append(classification)
+            if call_result is not None:
+                call_results.append(call_result)
+        return classifications, call_results
+
