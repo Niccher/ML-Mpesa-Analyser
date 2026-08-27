@@ -444,7 +444,7 @@ def _job_metadata(user_id: str, result: dict, status: str, duration: int, error:
 app = FastAPI(
     title="SMS Finance LLM Service",
     description="Autonomous DB-to-DB SMS financial processor with local llama.cpp",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
