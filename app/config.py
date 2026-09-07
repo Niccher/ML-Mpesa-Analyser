@@ -8,11 +8,21 @@ logger = logging.getLogger(__name__)
 
 class Settings:
     # ── Database details (must be loaded from env/defaults first for DB connection) ──
-    db_host: str = os.getenv("DB_HOST", "host.docker.internal")
-    db_port: int = int(os.getenv("DB_PORT", "3306"))
-    db_user: str = os.getenv("DB_USER", "root")
-    db_password: str = os.getenv("DB_PASSWORD", "")
-    db_name: str = os.getenv("DB_NAME", "mpesa_analyzer")
+    _db_url_env = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL")
+    if _db_url_env:
+        from urllib.parse import urlparse, unquote
+        _parsed = urlparse(_db_url_env)
+        db_host: str = _parsed.hostname or "host.docker.internal"
+        db_port: int = _parsed.port or 3306
+        db_user: str = unquote(_parsed.username or "root")
+        db_password: str = unquote(_parsed.password or "")
+        db_name: str = _parsed.path.lstrip("/") or "db_mpesa_analyzer"
+    else:
+        db_host: str = os.getenv("DB_HOST") or os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST") or "host.docker.internal"
+        db_port: int = int(os.getenv("DB_PORT") or os.getenv("MYSQLPORT") or os.getenv("MYSQL_PORT") or "3306")
+        db_user: str = os.getenv("DB_USER") or os.getenv("MYSQLUSER") or os.getenv("MYSQL_USER") or "root"
+        db_password: str = os.getenv("DB_PASSWORD") or os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_PASSWORD") or ""
+        db_name: str = os.getenv("DB_NAME") or os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE") or "db_mpesa_analyzer"
 
     def __init__(self):
         self._db_controls: dict[str, str] = {}
