@@ -2,20 +2,18 @@
 FROM python:3.12-slim
 
 # ── OS deps ───────────────────────────────────────────────────────────────────
-RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=apt-lib,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
-        libgomp1
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # ── 1. Python dependencies — installed FIRST before any heavy files ───────────
 # This is the most important cache layer: pip install only re-runs when
 # requirements.txt changes, NOT when app code or the model file changes.
 WORKDIR /app
 COPY requirements.txt .
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ── 2. Application code ────────────────────────────────────────────────────────
 COPY app/ ./app/
