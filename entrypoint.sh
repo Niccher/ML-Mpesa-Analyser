@@ -7,6 +7,12 @@ LLM_CTX_SIZE=${LLM_CTX_SIZE:-16384}
 LLM_BATCH_SIZE=${LLM_BATCH_SIZE:-512}
 N_GPU_LAYERS=${N_GPU_LAYERS:-0}
 
+if [ ! -f "${MODEL_PATH}" ]; then
+    echo "Model not found at ${MODEL_PATH}. Downloading from HuggingFace..."
+    mkdir -p "$(dirname "${MODEL_PATH}")"
+    curl -L --retry 3 -o "${MODEL_PATH}" "${MODEL_DOWNLOAD_URL:-https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf}"
+fi
+
 echo "Starting llama.cpp server on port ${LLAMA_PORT}..."
 llama-server \
     --model "${MODEL_PATH}" \

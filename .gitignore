@@ -35,8 +35,6 @@ Thumbs.db
 # ── Large binary assets (downloaded on build) ───────────────
 models/*.gguf
 models/*.bin
-llama-bin/llama-server
-llama-bin/*.so*
 llama-bin/*.dll
 llama-bin/*.dylib
 

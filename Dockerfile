@@ -15,18 +15,19 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── 2. Application code ────────────────────────────────────────────────────────
-COPY app/ ./app/
-
-# ── 3. llama.cpp server binary + shared libs ──────────────────────────────────
-# Separated so a binary update doesn't bust the pip or app-code layers.
+# ── 2. llama.cpp server binary + shared libs ──────────────────────────────────
 COPY llama-bin/llama-server /usr/local/bin/
 COPY llama-bin/*.so* /usr/local/lib/
 COPY llama-bin/*.so* /usr/local/bin/
 RUN ldconfig && ldd /usr/local/bin/llama-server
 
-# ── 4. Large GGUF model (rarely changes — keep last to avoid busting cache) ───
-COPY models/qwen2.5-1.5b-instruct-q4_k_m.gguf /models/
+# ── 3. Large GGUF model ───────────────────────────────────────────────────────
+RUN mkdir -p /models && \
+    curl -L --retry 3 -o /models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+    https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+# ── 4. Application code ────────────────────────────────────────────────────────
+COPY app/ ./app/
 
 ENV MODEL_PATH=/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 ENV LLAMA_PORT=8080
