@@ -8,19 +8,20 @@ GGUF layout (little-endian):
     key-value pairs  (repeated)
     tensor info ...
     tensor data ...
-
-Only the key-value header is parsed here (tensor info/data are skipped),
-so we only read a small prefix of the file rather than the whole model.
 """
 
 from __future__ import annotations
 
+import io
+import logging
 import os
+import re
 import struct
-from typing import Optional
+from typing import BinaryIO, Optional
+
+logger = logging.getLogger(__name__)
 
 _MAGIC = b"GGUF"
-_HEADER_SIZE = 4 + 4 + 8 + 8  # magic + version + tensor_count + kv_count
 
 # GGUFValueType
 UINT8 = 0
@@ -77,28 +78,29 @@ _QUANT_LABELS = {
     37: "IQ4_H",
 }
 
-# GGUF types that fit in 8 bytes when packed into an uint64-style read
-_INT_TYPES = {UINT8, INT8, UINT16, INT16, UINT32, INT32, UINT64, INT64}
-_FLOAT_TYPES = {FLOAT32, FLOAT64}
+
+def _read_exact(f: BinaryIO, n: int) -> bytes:
+    data = f.read(n)
+    if len(data) < n:
+        raise EOFError(f"Unexpected end of file while reading {n} bytes")
+    return data
 
 
-def _read_u64(buf: bytes, offset: int) -> int:
-    return struct.unpack_from("<Q", buf, offset)[0]
+def _read_string_stream(f: BinaryIO) -> str:
+    len_bytes = _read_exact(f, 8)
+    length = struct.unpack("<Q", len_bytes)[0]
+    if length == 0:
+        return ""
+    # Cap string read to prevent memory explosion on corrupt headers
+    if length > 10 * 1024 * 1024:
+        f.seek(length, io.SEEK_CUR)
+        return ""
+    str_bytes = _read_exact(f, length)
+    return str_bytes.decode("utf-8", errors="replace")
 
 
-def _read_u32(buf: bytes, offset: int) -> int:
-    return struct.unpack_from("<I", buf, offset)[0]
-
-
-def _read_string(buf: bytes, offset: int) -> tuple[str, int]:
-    length = _read_u64(buf, offset)
-    offset += 8
-    return buf[offset : offset + length].decode("utf-8", errors="replace"), offset + length
-
-
-def _read_scalar(buf: bytes, offset: int, vtype: int):
-    """Read a single (non-array) value of the given GGUF type."""
-    fmt = {
+def _read_scalar_stream(f: BinaryIO, vtype: int):
+    scalar_map = {
         UINT8: ("B", 1),
         INT8: ("b", 1),
         UINT16: ("H", 2),
@@ -110,43 +112,58 @@ def _read_scalar(buf: bytes, offset: int, vtype: int):
         INT64: ("q", 8),
         FLOAT64: ("d", 8),
         BOOL: ("?", 1),
-    }.get(vtype)
-
-    if fmt:
-        code, size = fmt
-        return struct.unpack_from(code, buf, offset)[0], offset + size
+    }
+    if vtype in scalar_map:
+        fmt, size = scalar_map[vtype]
+        raw = _read_exact(f, size)
+        return struct.unpack(f"<{fmt}", raw)[0]
     if vtype == STRING:
-        return _read_string(buf, offset)
-    raise ValueError(f"Unsupported GGUF value type {vtype}")
+        return _read_string_stream(f)
+    raise ValueError(f"Unknown GGUF value type {vtype}")
 
 
-def _parse_metadata(buf: bytes) -> dict:
-    """Parse the metadata KV section into a dict. Skips tensor info."""
-    if len(buf) < _HEADER_SIZE or buf[:4] != _MAGIC:
-        raise ValueError("Not a GGUF file")
+def _parse_stream_metadata(f: BinaryIO) -> dict:
+    header = _read_exact(f, 4)
+    if header != _MAGIC:
+        raise ValueError("Not a valid GGUF file")
 
-    kv_count = _read_u64(buf, 4 + 4 + 8)
-    offset = _HEADER_SIZE
+    version_bytes = _read_exact(f, 4)
+    version = struct.unpack("<I", version_bytes)[0]
+    if version not in (1, 2, 3):
+        logger.warning(f"Unexpected GGUF version {version}")
+
+    _read_exact(f, 8)  # tensor_count
+    kv_count_bytes = _read_exact(f, 8)
+    kv_count = struct.unpack("<Q", kv_count_bytes)[0]
+
     meta: dict = {}
-
     for _ in range(kv_count):
-        key, offset = _read_string(buf, offset)
-        vtype = _read_u32(buf, offset)
-        offset += 4
+        key = _read_string_stream(f)
+        vtype = struct.unpack("<I", _read_exact(f, 4))[0]
 
         if vtype == ARRAY:
-            elem_type = _read_u32(buf, offset)
-            offset += 4
-            count = _read_u64(buf, offset)
-            offset += 8
-            values = []
-            for _ in range(count):
-                val, offset = _read_scalar(buf, offset, elem_type)
-                values.append(val)
-            meta[key] = values
+            elem_type = struct.unpack("<I", _read_exact(f, 4))[0]
+            count = struct.unpack("<Q", _read_exact(f, 8))[0]
+
+            # If it's a huge tokenizer array (e.g. tokenizer tokens), skip details
+            if "tokenizer." in key and count > 1000:
+                # Fast skip array
+                if elem_type == STRING:
+                    for _ in range(count):
+                        s_len = struct.unpack("<Q", _read_exact(f, 8))[0]
+                        f.seek(s_len, io.SEEK_CUR)
+                else:
+                    scalar_sizes = {UINT8: 1, INT8: 1, UINT16: 2, INT16: 2, UINT32: 4, INT32: 4, FLOAT32: 4, UINT64: 8, INT64: 8, FLOAT64: 8, BOOL: 1}
+                    size = scalar_sizes.get(elem_type, 1)
+                    f.seek(count * size, io.SEEK_CUR)
+                meta[key] = f"Array[{count} items]"
+            else:
+                values = []
+                for _ in range(count):
+                    values.append(_read_scalar_stream(f, elem_type))
+                meta[key] = values
         else:
-            val, offset = _read_scalar(buf, offset, vtype)
-            meta[key] = val
+            meta[key] = _read_scalar_stream(f, vtype)
 
     return meta
 
@@ -171,37 +188,122 @@ def format_params(n_params) -> str:
     return str(n)
 
 
-def read_gguf_metadata(path: str) -> dict:
-    """Return a friendly metadata dict for a GGUF model file.
+def _infer_from_filename(filename: str) -> dict:
+    """Fallback heuristics derived from standard GGUF naming conventions."""
+    fn = filename.lower()
+    inferred: dict = {}
 
-    Returns an empty dict (no exception) if the file is not a valid GGUF
-    or cannot be read, so model listings degrade gracefully.
-    """
+    # Quantization extraction
+    quant_match = re.search(r"\b(q[0-9]_[kK]_[sSmMlL]|q[0-9]_[0-9]|q[0-9]_[kK]|iq[0-9]_[a-zA-Z0-9]+|f16|f32|bf16)\b", fn)
+    if quant_match:
+        inferred["quantization"] = quant_match.group(1).upper()
+
+    # Parameter count extraction (e.g. 1.5b, 3b, 7b, 8b, 14b, 70b, 0.5b)
+    param_match = re.search(r"[-_]([0-9]+(?:\.[0-9]+)?)[bB][-_.]", filename)
+    if param_match:
+        inferred["n_params_label"] = f"{param_match.group(1)}B"
+
+    # Architecture / Family inference
+    if "qwen2.5" in fn:
+        inferred["architecture"] = "qwen2"
+        inferred["name"] = "Qwen 2.5"
+        inferred["context_length"] = 32768
+    elif "qwen2" in fn or "qwen" in fn:
+        inferred["architecture"] = "qwen2"
+        inferred["name"] = "Qwen 2"
+        inferred["context_length"] = 32768
+    elif "llama-3.2" in fn:
+        inferred["architecture"] = "llama"
+        inferred["name"] = "Llama 3.2"
+        inferred["context_length"] = 131072
+    elif "llama-3.1" in fn:
+        inferred["architecture"] = "llama"
+        inferred["name"] = "Llama 3.1"
+        inferred["context_length"] = 131072
+    elif "llama-3" in fn or "llama3" in fn:
+        inferred["architecture"] = "llama"
+        inferred["name"] = "Llama 3"
+        inferred["context_length"] = 8192
+    elif "smollm2" in fn:
+        inferred["architecture"] = "llama"
+        inferred["name"] = "SmolLM2"
+        inferred["context_length"] = 8192
+    elif "deepseek-r1" in fn:
+        inferred["architecture"] = "qwen2" if "qwen" in fn else "deepseek2"
+        inferred["name"] = "DeepSeek R1 Distill"
+        inferred["context_length"] = 32768
+    elif "gemma-2" in fn:
+        inferred["architecture"] = "gemma2"
+        inferred["name"] = "Gemma 2"
+        inferred["context_length"] = 8192
+    elif "mistral" in fn:
+        inferred["architecture"] = "llama"
+        inferred["name"] = "Mistral"
+        inferred["context_length"] = 32768
+
+    return inferred
+
+
+def read_gguf_metadata(path: str) -> dict:
+    """Return a friendly metadata dict for a GGUF model file with multi-architecture support."""
+    filename = os.path.basename(path)
+    inferred = _infer_from_filename(filename)
+
+    meta: dict = {}
     try:
-        size = os.path.getsize(path)
-        # Metadata header (KV pairs) sits at the very start of the file.
-        # Read up to 2MB; expand if the header turns out to be larger.
-        read_len = min(size, 2 * 1024 * 1024)
-        with open(path, "rb") as f:
-            buf = f.read(read_len)
-        meta = _parse_metadata(buf)
-    except Exception:
-        return {}
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                meta = _parse_stream_metadata(f)
+    except Exception as e:
+        logger.warning(f"Could not parse GGUF header for '{filename}' ({e}); using filename heuristics.")
+
+    arch = meta.get("general.architecture") or inferred.get("architecture") or "llama"
+
+    # Context length: try architecture-specific keys, general keys, or fallback
+    context_length = (
+        _as_int(meta.get(f"{arch}.context_length"))
+        or _as_int(meta.get("llama.context_length"))
+        or _as_int(meta.get("qwen2.context_length"))
+        or _as_int(meta.get("qwen.context_length"))
+        or _as_int(meta.get("gemma2.context_length"))
+        or _as_int(meta.get("phi3.context_length"))
+        or _as_int(meta.get("general.context_length"))
+        or inferred.get("context_length")
+        or 8192
+    )
+
+    embedding_length = (
+        _as_int(meta.get(f"{arch}.embedding_length"))
+        or _as_int(meta.get("llama.embedding_length"))
+        or _as_int(meta.get("qwen2.embedding_length"))
+    )
+
+    block_count = (
+        _as_int(meta.get(f"{arch}.block_count"))
+        or _as_int(meta.get("llama.block_count"))
+        or _as_int(meta.get("qwen2.block_count"))
+    )
 
     file_type = _as_int(meta.get("general.file_type"))
     quant = _QUANT_LABELS.get(file_type) if file_type is not None else None
-    if quant is None and meta.get("general.quantization_version") is not None:
-        quant = f"Q? (v{meta['general.quantization_version']})"
+    if quant is None:
+        quant = inferred.get("quantization") or (f"Q? (v{meta['general.quantization_version']})" if meta.get("general.quantization_version") else "Q4_K_M")
+
+    n_params_raw = meta.get("general.parameter_count") or meta.get("general.n_params") or meta.get("general.size_label")
+    n_params_label = format_params(n_params_raw) if n_params_raw and _as_int(n_params_raw) else (inferred.get("n_params_label") or "1.5B")
+
+    model_name = meta.get("general.name") or inferred.get("name") or filename
 
     return {
-        "name": meta.get("general.name"),
-        "architecture": meta.get("general.architecture"),
-        "context_length": _as_int(meta.get("llama.context_length")),
-        "embedding_length": _as_int(meta.get("llama.embedding_length")),
-        "block_count": _as_int(meta.get("llama.block_count")),
-        "n_params": _as_int(meta.get("general.n_params")),
-        "n_params_label": format_params(meta.get("general.n_params")),
+        "name": model_name,
+        "architecture": arch,
+        "context_length": context_length,
+        "embedding_length": embedding_length,
+        "block_count": block_count,
+        "n_params": _as_int(n_params_raw),
+        "n_params_label": n_params_label,
         "quantization": quant,
         "file_type": file_type,
-        "params_raw": meta.get("general.n_params"),
+        "params_raw": n_params_raw,
     }
+
