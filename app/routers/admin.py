@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import shutil
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-import shutil
 from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel, Field
+
+KNOWN_MODEL_PRESETS: dict[str, str] = {
+    "qwen2.5-1.5b-instruct-q4_k_m.gguf": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    "qwen2.5-3b-instruct-q4_k_m.gguf": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "Llama-3.2-1B-Instruct-Q4_K_M.gguf": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "Llama-3.2-3B-Instruct-Q4_K_M.gguf": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf": "https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+    "smollm2-1.7b-instruct-q4_k_m.gguf": "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf",
+}
 
 from app.config import settings
 from app.db.connection import verify_connection
@@ -428,12 +439,46 @@ async def _restart_llama_server(model_path: str) -> str:
 
 @router.post("/models/activate")
 async def activate_model(payload: ModelActivate):
-    """Mark a model file as active by updating MODEL_PATH env, DB controls, and reloading llama-server."""
+    """Mark a model file as active by updating MODEL_PATH env, DB controls, and reloading llama-server.
+
+    If the model file is not on disk but matches a tested preset, automatically starts a safe download.
+    """
     model_dir = os.getenv("MODEL_DIR", "/models")
     full = os.path.join(model_dir, payload.filename)
 
     if not os.path.isfile(full):
-        return {"status": "error", "message": f"Model file not found: {payload.filename}"}
+        if payload.filename in KNOWN_MODEL_PRESETS:
+            task_id = uuid.uuid4().hex[:12]
+            preset_url = KNOWN_MODEL_PRESETS[payload.filename]
+            _download_tasks[task_id] = {
+                "task_id": task_id,
+                "status": "downloading",
+                "filename": payload.filename,
+                "progress_pct": 0.0,
+                "bytes_received": 0,
+                "total_bytes": 0,
+                "message": f"Model '{payload.filename}' not found on disk. Started background download and automatic activation.",
+            }
+            asyncio.create_task(
+                _stream_download_task(
+                    task_id, preset_url, full, auto_activate=True, llm_model=payload.llm_model
+                )
+            )
+            return {
+                "status": "downloading",
+                "task_id": task_id,
+                "message": f"Model '{payload.filename}' is not on disk yet. Auto-downloading and activating in background...",
+            }
+        return {"status": "error", "message": f"Model file not found on disk: {payload.filename}"}
+
+    # Verify GGUF header before activating to prevent crashing llama.cpp
+    try:
+        with open(full, "rb") as vf:
+            magic = vf.read(4)
+        if magic != b"GGUF":
+            return {"status": "error", "message": f"Cannot activate: '{payload.filename}' is corrupted or missing GGUF header (got {magic!r})."}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not verify '{payload.filename}': {e}"}
 
     env_path = os.getenv("ENV_FILE", "/app/.env")
     _set_env("MODEL_PATH", full, env_path)
@@ -465,7 +510,7 @@ async def activate_model(payload: ModelActivate):
 
 @router.post("/models/upload")
 async def upload_model(file: UploadFile = File(...)):
-    """Upload a .gguf/.bin model file into MODEL_DIR."""
+    """Upload a .gguf/.bin model file into MODEL_DIR safely with verification."""
     allowed = {".gguf", ".bin"}
     filename = os.path.basename(file.filename or "")
     ext = os.path.splitext(filename)[1].lower()
@@ -475,25 +520,43 @@ async def upload_model(file: UploadFile = File(...)):
 
     model_dir = os.getenv("MODEL_DIR", "/models")
     if not os.path.isdir(model_dir):
-        await file.close()
-        return {"status": "error", "message": f"Model directory not found: {model_dir}"}
+        os.makedirs(model_dir, exist_ok=True)
 
     dest = os.path.join(model_dir, filename)
+    temp_upload = dest + ".upload"
     if os.path.exists(dest):
         await file.close()
         return {"status": "error", "message": f"A model named '{filename}' already exists."}
 
     total = 0
     try:
-        with open(dest, "wb") as out:
+        with open(temp_upload, "wb") as out:
             while chunk := await file.read(1024 * 1024):
                 out.write(chunk)
                 total += len(chunk)
+
+        if ext == ".gguf":
+            with open(temp_upload, "rb") as vf:
+                magic = vf.read(4)
+            if magic != b"GGUF":
+                if os.path.exists(temp_upload):
+                    os.remove(temp_upload)
+                await file.close()
+                return {"status": "error", "message": "Uploaded file is not a valid GGUF binary (missing GGUF magic header)."}
+
+        if total < 10 * 1024 * 1024:
+            if os.path.exists(temp_upload):
+                os.remove(temp_upload)
+            await file.close()
+            return {"status": "error", "message": f"Uploaded file is too small ({round(total / 1024 / 1024, 2)} MB) to be a valid model."}
+
+        os.replace(temp_upload, dest)
     except Exception as e:
-        try:
-            os.remove(dest)
-        except Exception:
-            pass
+        if os.path.exists(temp_upload):
+            try:
+                os.remove(temp_upload)
+            except Exception:
+                pass
         await file.close()
         return {"status": "error", "message": f"Upload failed: {e}"}
 
@@ -501,7 +564,7 @@ async def upload_model(file: UploadFile = File(...)):
     logger.info(f"Uploaded model '{filename}' ({round(total/1024/1024,1)} MB)")
     return {
         "status": "ok",
-        "message": f"'{filename}' uploaded ({round(total/1024/1024, 1)} MB). Restart llama.cpp to serve it.",
+        "message": f"'{filename}' uploaded and verified ({round(total/1024/1024, 1)} MB).",
         "filename": filename,
         "size_mb": round(total / 1024 / 1024, 1),
     }
@@ -540,7 +603,14 @@ async def delete_model(payload: ModelDelete):
 _download_tasks: dict[str, dict] = {}
 
 
-async def _stream_download_task(task_id: str, url: str, dest_path: str, hf_token: Optional[str] = None):
+async def _stream_download_task(
+    task_id: str,
+    url: str,
+    dest_path: str,
+    hf_token: Optional[str] = None,
+    auto_activate: bool = False,
+    llm_model: Optional[str] = None,
+):
     headers = {"User-Agent": "MpesaAnalyzer/1.0"}
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
@@ -569,14 +639,60 @@ async def _stream_download_task(task_id: str, url: str, dest_path: str, hf_token
                         else:
                             _download_tasks[task_id]["progress_pct"] = 0.0
 
-                if os.path.exists(dest_path):
-                    os.remove(dest_path)
-                os.rename(temp_path, dest_path)
-                _download_tasks[task_id]["status"] = "done"
-                _download_tasks[task_id]["progress_pct"] = 100.0
+                # Validate downloaded binary before replacing destination
+                if received < 10 * 1024 * 1024:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    _download_tasks[task_id]["status"] = "error"
+                    _download_tasks[task_id]["message"] = (
+                        f"Downloaded file is too small ({round(received / 1024 / 1024, 2)} MB) and likely corrupted."
+                    )
+                    return
+
+                with open(temp_path, "rb") as vf:
+                    magic = vf.read(4)
+                if magic != b"GGUF":
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    _download_tasks[task_id]["status"] = "error"
+                    _download_tasks[task_id]["message"] = (
+                        f"Downloaded file is not a valid GGUF binary (header: {magic!r}). Check URL or token."
+                    )
+                    return
+
+                # Atomic move into destination
+                os.replace(temp_path, dest_path)
                 _download_tasks[task_id]["size_mb"] = round(received / (1024 * 1024), 1)
-                _download_tasks[task_id]["message"] = f"'{os.path.basename(dest_path)}' downloaded successfully."
-                logger.info(f"Downloaded model '{os.path.basename(dest_path)}' ({round(received / (1024 * 1024), 1)} MB)")
+                _download_tasks[task_id]["progress_pct"] = 100.0
+                logger.info(f"Downloaded and verified model '{os.path.basename(dest_path)}' ({round(received / (1024 * 1024), 1)} MB)")
+
+                if auto_activate:
+                    env_path = os.getenv("ENV_FILE", "/app/.env")
+                    _set_env("MODEL_PATH", dest_path, env_path)
+                    os.environ["MODEL_PATH"] = dest_path
+                    settings.model_path = dest_path
+                    try:
+                        await set_control("model_path", dest_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to persist model_path control: {e}")
+
+                    model_name = llm_model or os.path.splitext(os.path.basename(dest_path))[0]
+                    _set_env("LLM_MODEL", model_name, env_path)
+                    os.environ["LLM_MODEL"] = model_name
+                    settings.llm_model = model_name
+                    try:
+                        await set_control("llm_model", model_name)
+                    except Exception as e:
+                        logger.warning(f"Failed to persist llm_model control: {e}")
+
+                    restart_msg = await _restart_llama_server(dest_path)
+                    _download_tasks[task_id]["status"] = "done"
+                    _download_tasks[task_id]["message"] = (
+                        f"'{os.path.basename(dest_path)}' downloaded, verified, and activated. {restart_msg}"
+                    )
+                else:
+                    _download_tasks[task_id]["status"] = "done"
+                    _download_tasks[task_id]["message"] = f"'{os.path.basename(dest_path)}' downloaded and verified successfully."
     except Exception as e:
         logger.error(f"Download failed for task {task_id}: {e}")
         if os.path.exists(temp_path):
@@ -616,8 +732,6 @@ async def download_model(payload: ModelDownloadRequest):
     if os.path.exists(dest):
         return {"status": "error", "message": f"A model file named '{filename}' already exists."}
 
-    import asyncio
-    import uuid
     task_id = uuid.uuid4().hex[:12]
     _download_tasks[task_id] = {
         "task_id": task_id,
