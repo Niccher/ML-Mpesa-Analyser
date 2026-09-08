@@ -28,6 +28,7 @@ from app.db.queries import (
     set_control,
     set_prompt_active,
 )
+from app.models.schemas import ModelDownloadRequest
 from app.services.classifier import SenderClassifier
 from app.services.extractor import MessageExtractor
 from app.services.gguf_metadata import read_gguf_metadata
@@ -487,6 +488,118 @@ async def delete_model(payload: ModelDelete):
 
     logger.info(f"Deleted model '{filename}'")
     return {"status": "ok", "message": f"'{filename}' deleted.", "filename": filename}
+
+
+_download_tasks: dict[str, dict] = {}
+
+
+async def _stream_download_task(task_id: str, url: str, dest_path: str, hf_token: Optional[str] = None):
+    headers = {"User-Agent": "MpesaAnalyzer/1.0"}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
+    temp_path = dest_path + ".download"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(900.0, connect=30.0)) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    _download_tasks[task_id]["status"] = "error"
+                    _download_tasks[task_id]["message"] = f"HTTP {resp.status_code}: {resp.reason_phrase}"
+                    return
+
+                total_str = resp.headers.get("content-length")
+                total = int(total_str) if total_str and total_str.isdigit() else 0
+                _download_tasks[task_id]["total_bytes"] = total
+                received = 0
+
+                with open(temp_path, "wb") as out:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 512):
+                        out.write(chunk)
+                        received += len(chunk)
+                        _download_tasks[task_id]["bytes_received"] = received
+                        if total > 0:
+                            _download_tasks[task_id]["progress_pct"] = round((received / total) * 100, 1)
+                        else:
+                            _download_tasks[task_id]["progress_pct"] = 0.0
+
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                os.rename(temp_path, dest_path)
+                _download_tasks[task_id]["status"] = "done"
+                _download_tasks[task_id]["progress_pct"] = 100.0
+                _download_tasks[task_id]["size_mb"] = round(received / (1024 * 1024), 1)
+                _download_tasks[task_id]["message"] = f"'{os.path.basename(dest_path)}' downloaded successfully."
+                logger.info(f"Downloaded model '{os.path.basename(dest_path)}' ({round(received / (1024 * 1024), 1)} MB)")
+    except Exception as e:
+        logger.error(f"Download failed for task {task_id}: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        _download_tasks[task_id]["status"] = "error"
+        _download_tasks[task_id]["message"] = f"Download failed: {e}"
+
+
+@router.post("/models/download")
+async def download_model(payload: ModelDownloadRequest):
+    """Initiate a background download of a .gguf/.bin model from a URL or Hugging Face."""
+    url = (payload.url or "").strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return {"status": "error", "message": "URL must start with http:// or https://"}
+
+    filename = (payload.filename or "").strip()
+    if not filename:
+        from urllib.parse import unquote, urlparse
+        parsed = urlparse(url)
+        path = unquote(parsed.path)
+        filename = os.path.basename(path)
+
+    filename = os.path.basename(filename)
+    allowed = {".gguf", ".bin"}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in allowed:
+        return {"status": "error", "message": f"Filename must end with .gguf or .bin. Detected: '{filename}'"}
+
+    model_dir = os.getenv("MODEL_DIR", "/models")
+    if not os.path.isdir(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
+
+    dest = os.path.join(model_dir, filename)
+    if os.path.exists(dest):
+        return {"status": "error", "message": f"A model file named '{filename}' already exists."}
+
+    import asyncio
+    import uuid
+    task_id = uuid.uuid4().hex[:12]
+    _download_tasks[task_id] = {
+        "task_id": task_id,
+        "status": "downloading",
+        "filename": filename,
+        "progress_pct": 0.0,
+        "bytes_received": 0,
+        "total_bytes": 0,
+        "message": "Download in progress...",
+    }
+
+    asyncio.create_task(_stream_download_task(task_id, url, dest, payload.hf_token))
+
+    return {
+        "status": "started",
+        "task_id": task_id,
+        "filename": filename,
+        "message": f"Started background download of '{filename}'.",
+    }
+
+
+@router.get("/models/download/{task_id}")
+async def get_download_status(task_id: str):
+    """Check progress of a background model download task."""
+    task = _download_tasks.get(task_id)
+    if not task:
+        return {"status": "error", "message": f"Download task '{task_id}' not found."}
+    return task
+
 
 
 # ── Prompt version management ─────────────────────────────

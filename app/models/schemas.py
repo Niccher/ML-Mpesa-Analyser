@@ -135,3 +135,10 @@ class ProcessingJobResponse(BaseModel):
     duration_seconds: Optional[int] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+
+
+class ModelDownloadRequest(BaseModel):
+    url: str
+    filename: Optional[str] = None
+    hf_token: Optional[str] = None
+

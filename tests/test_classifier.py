@@ -6,7 +6,7 @@ from app.services.classifier import SenderClassifier
 
 @pytest.mark.asyncio
 async def test_known_sender_mpesa():
-    result = await SenderClassifier.classify(
+    result, _ = await SenderClassifier.classify(
         "MPESA",
         ["You have received Ksh 1,000.00 from John"],
     )
@@ -17,7 +17,7 @@ async def test_known_sender_mpesa():
 
 @pytest.mark.asyncio
 async def test_known_sender_kcb():
-    result = await SenderClassifier.classify(
+    result, _ = await SenderClassifier.classify(
         "KCB",
         ["Ksh 5,000 CR from M-PESA. Balance: Ksh 25,000"],
     )
@@ -28,7 +28,7 @@ async def test_known_sender_kcb():
 
 @pytest.mark.asyncio
 async def test_known_sender_tala():
-    result = await SenderClassifier.classify(
+    result, _ = await SenderClassifier.classify(
         "TALA",
         ["Your loan of Ksh 3,000 has been disbursed to your M-PESA"],
     )
@@ -38,7 +38,7 @@ async def test_known_sender_tala():
 
 @pytest.mark.asyncio
 async def test_unknown_sender_no_content():
-    result = await SenderClassifier.classify(
+    result, _ = await SenderClassifier.classify(
         "UNKNOWN_SENDER",
         [],
     )
@@ -48,10 +48,9 @@ async def test_unknown_sender_no_content():
 
 @pytest.mark.asyncio
 async def test_non_finance_sender():
-    result = await SenderClassifier.classify(
+    result, _ = await SenderClassifier.classify(
         "PIZZA_INN",
         ["Your order of large pizza is confirmed. ETA 30 min"],
     )
-    # No match in known list, LLM not called for test without mock
-    # Falls through to LLM call which raises, returning non-finance
     assert result.is_finance is False
+
