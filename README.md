@@ -78,6 +78,46 @@ Full parameter reference: [docs/user/configuration.md](docs/user/configuration.m
 
 ---
 
+## Deployment (Railway & Cloud)
+
+### Quick Setup Steps on Railway
+1. Create a new project on Railway and attach a **MySQL** database plugin.
+2. Deploy the **ML Microservice** container repository connected to the MySQL service.
+3. Deploy the **WebApp** repository connected to the same MySQL service.
+4. Copy-paste the environment variables below into Railway's **Variables -> Bulk Raw Editor**.
+
+### Python ML Microservice Environment Variables
+
+**JSON Bulk Import Format:**
+```json
+{
+  "MYSQL_HOST": "${{MySQL.MYSQLHOST}}",
+  "MYSQL_USER": "${{MySQL.MYSQLUSER}}",
+  "MYSQL_PASSWORD": "${{MySQL.MYSQLPASSWORD}}",
+  "MYSQL_DATABASE": "${{MySQL.MYSQLDATABASE}}",
+  "MYSQL_PORT": "${{MySQL.MYSQLPORT}}",
+  "PORT": "9050",
+  "GEMINI_API_KEY": "<YOUR_GEMINI_API_KEY>"
+}
+```
+
+**Raw `.env` Format:**
+```env
+MYSQL_HOST=${{MySQL.MYSQLHOST}}
+MYSQL_USER=${{MySQL.MYSQLUSER}}
+MYSQL_PASSWORD=${{MySQL.MYSQLPASSWORD}}
+MYSQL_DATABASE=${{MySQL.MYSQLDATABASE}}
+MYSQL_PORT=${{MySQL.MYSQLPORT}}
+PORT=9050
+GEMINI_API_KEY=<YOUR_GEMINI_API_KEY>
+```
+
+### Health & Database Probe
+- **Microservice Liveness & DB Connection Probe**: `GET https://<your-ml-domain>.up.railway.app/health`
+  *Returns `{"status": "ok", "db_configured": true}` when Python microservice successfully queries the MySQL container.*
+
+---
+
 ## Something Went Wrong?
 
 - **Container fails health check**: Model file may be missing from `models/`. Check `ls -lh models/`.
