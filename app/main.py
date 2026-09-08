@@ -443,10 +443,33 @@ def _job_metadata(user_id: str, result: dict, status: str, duration: int, error:
 
 from fastapi.staticfiles import StaticFiles
 
+openapi_tags = [
+    {"name": "System Health", "description": "Liveness probes, DB connection status, and LLM model provider telemetry."},
+    {"name": "Autonomous Pipeline", "description": "DB-to-DB background processing triggers, batch rescan execution, and job status."},
+    {"name": "Classification & Extraction", "description": "Sender categorization and financial payload extraction endpoints."},
+]
+
 app = FastAPI(
-    title="SMS Finance LLM Service",
-    description="Autonomous DB-to-DB SMS financial processor with local llama.cpp",
-    version="1.2.0",
+    title="Universal Financial Intelligence Microservice",
+    description="""
+### 🧠 Universal Multi-Channel Financial Analytics Microservice
+
+An autonomous **DB-to-DB SMS & Financial Transaction Processor** powered by local `llama.cpp` / Qwen models.
+
+* **Multi-Source Financial Classification**: Categorizes transactions across Banks, Mobile Money, SACCOs, Fintechs, and Cards.
+* **Autonomous Worker Loop**: Asynchronously processes unprocessed transaction payloads with per-user lock isolation.
+* **Telemetry & Hit Tracking**: Logs per-transaction LLM execution time, token usage, and classification confidence.
+""",
+    version="1.4.0",
+    contact={
+        "name": "Financial Analyzer Ecosystem",
+        "url": "https://github.com/niccher/Mpesa_Analyzer_App",
+    },
+    license_info={
+        "name": "MIT License",
+        "url": "https://opensource.org/licenses/MIT",
+    },
+    openapi_tags=openapi_tags,
     lifespan=lifespan,
     swagger_favicon_url="/static/favicon.ico",
 )
