@@ -353,6 +353,24 @@ async def lifespan(app: FastAPI):
             await ensure_all_tables()
             # Dynamic settings hot-reload from database
             await settings.reload_from_db()
+
+            # Auto-cleanup orphan processing jobs stuck from previous service/container crashes
+            from app.db.connection import get_engine as _ge
+            from sqlalchemy import text as _text
+            try:
+                engine = _ge()
+                async with engine.connect() as conn:
+                    await conn.execute(
+                        _text(
+                            "UPDATE tbl_Processing_Jobs "
+                            "SET status='failed', completed_at=NOW(), "
+                            "metadata=JSON_SET(COALESCE(metadata, '{}'), '$.error', 'Terminated due to service restart') "
+                            "WHERE status IN ('starting', 'processing')"
+                        )
+                    )
+                    await conn.commit()
+            except Exception as ex:
+                logger.warning(f"Could not clean up orphan processing jobs at startup: {ex}")
     except Exception as e:
         logger.warning(f"Could not ensure ML tables or load configs at startup: {e}")
 
