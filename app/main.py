@@ -444,7 +444,7 @@ def _job_metadata(user_id: str, result: dict, status: str, duration: int, error:
         meta.update({
             "model": settings.llm_model,
             "model_provider": settings.llm_provider,
-            "model_path": os.getenv("MODEL_PATH", ""),
+            "model_path": getattr(settings, "model_path", None) or os.getenv("MODEL_PATH", ""),
             "model_base_url": settings.llm_base_url,
             "llm_max_tokens": settings.llm_max_tokens,
             "llm_temperature": settings.llm_temperature,

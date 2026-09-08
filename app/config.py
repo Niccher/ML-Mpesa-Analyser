@@ -32,6 +32,7 @@ class Settings:
         self.llm_api_key = "not-needed"
         self.llm_base_url = "http://localhost:8080/v1"
         self.llm_model = "qwen2.5-1.5b-instruct"
+        self.model_path = os.getenv("MODEL_PATH", "/models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
         self.llm_max_tokens = 2048
         self.llm_temperature = 0.2
 
@@ -83,6 +84,7 @@ class Settings:
         self.llm_api_key = os.getenv("LLM_API_KEY", self.llm_api_key)
         self.llm_base_url = os.getenv("LLM_BASE_URL", self.llm_base_url)
         self.llm_model = os.getenv("LLM_MODEL", self.llm_model)
+        self.model_path = os.getenv("MODEL_PATH", self.model_path)
         self.llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", str(self.llm_max_tokens)))
         self.llm_temperature = float(os.getenv("LLM_TEMPERATURE", str(self.llm_temperature)))
 
@@ -152,6 +154,7 @@ class Settings:
                 self._apply_db_val("llm_api_key", str)
                 self._apply_db_val("llm_base_url", str)
                 self._apply_db_val("llm_model", str)
+                self._apply_db_val("model_path", str)
                 self._apply_db_val("llm_max_tokens", int)
                 self._apply_db_val("llm_temperature", float)
 
@@ -191,6 +194,11 @@ class Settings:
                 self._apply_db_val("batch_size", int)
                 self._apply_db_val("max_retries", int)
                 self._apply_db_val("poll_interval", int)
+
+                if getattr(self, "model_path", None):
+                    os.environ["MODEL_PATH"] = str(self.model_path)
+                if getattr(self, "llm_model", None):
+                    os.environ["LLM_MODEL"] = str(self.llm_model)
 
                 logger.info(f"Loaded {len(controls)} configurations from tbl_ML_Controls. Current Engine: {self.llm_engine}")
         except Exception as e:

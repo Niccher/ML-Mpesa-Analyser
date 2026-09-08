@@ -390,12 +390,45 @@ async def test_connection(payload: ConnectionTest):
         return {"status": "error", "message": f"Connection failed: {str(e)}"}
 
 
+async def _restart_llama_server(model_path: str) -> str:
+    """Terminates any running llama-server process and restarts it with the new model."""
+    import shutil
+    import subprocess
+
+    llama_bin = shutil.which("llama-server") or "/usr/local/bin/llama-server"
+    if not os.path.isfile(llama_bin) and not shutil.which("llama-server"):
+        return "Model activated in database & configuration."
+
+    try:
+        subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=5)
+        await asyncio.sleep(1)
+
+        port = os.getenv("LLAMA_PORT", "8080")
+        ctx_size = str(settings.llm_ctx_size or 16384)
+        batch_size = str(settings.llm_batch_size or 512)
+        n_gpu = str(settings.n_gpu_layers or 0)
+
+        cmd = [
+            llama_bin,
+            "--model", model_path,
+            "--port", str(port),
+            "--host", "0.0.0.0",
+            "--ctx-size", str(ctx_size),
+            "--batch-size", str(batch_size),
+            "--n-gpu-layers", str(n_gpu),
+            "--mlock",
+        ]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        logger.info(f"Spawned llama-server with model {model_path} on port {port}")
+        return "llama-server restarted with new model."
+    except Exception as e:
+        logger.warning(f"Could not auto-restart llama-server: {e}")
+        return f"Model activated in database. (llama-server restart note: {e})"
+
+
 @router.post("/models/activate")
 async def activate_model(payload: ModelActivate):
-    """Mark a model file as active by updating MODEL_PATH env + .env file.
-
-    A llama.cpp restart is required for the new model to be served.
-    """
+    """Mark a model file as active by updating MODEL_PATH env, DB controls, and reloading llama-server."""
     model_dir = os.getenv("MODEL_DIR", "/models")
     full = os.path.join(model_dir, payload.filename)
 
@@ -404,15 +437,29 @@ async def activate_model(payload: ModelActivate):
 
     env_path = os.getenv("ENV_FILE", "/app/.env")
     _set_env("MODEL_PATH", full, env_path)
-    if payload.llm_model:
-        _set_env("LLM_MODEL", payload.llm_model, env_path)
-        settings.llm_model = payload.llm_model
+    os.environ["MODEL_PATH"] = full
+    settings.model_path = full
+    try:
+        await set_control("model_path", full)
+    except Exception as e:
+        logger.warning(f"Failed to persist model_path control: {e}")
+
+    llm_model_val = payload.llm_model or os.path.splitext(payload.filename)[0]
+    _set_env("LLM_MODEL", llm_model_val, env_path)
+    os.environ["LLM_MODEL"] = llm_model_val
+    settings.llm_model = llm_model_val
+    try:
+        await set_control("llm_model", llm_model_val)
+    except Exception as e:
+        logger.warning(f"Failed to persist llm_model control: {e}")
+
+    restart_msg = await _restart_llama_server(full)
 
     return {
         "status": "ok",
-        "message": f"Model '{payload.filename}' set active. Restart llama.cpp to load it.",
+        "message": f"Model '{payload.filename}' is now active. {restart_msg}",
         "model_path": full,
-        "llm_model": payload.llm_model or settings.llm_model,
+        "llm_model": llm_model_val,
     }
 
 
@@ -477,7 +524,7 @@ async def delete_model(payload: ModelDelete):
     except Exception as e:
         return {"status": "error", "message": f"Could not verify file: {e}"}
 
-    active_path = os.getenv("MODEL_PATH", "")
+    active_path = getattr(settings, "model_path", None) or os.getenv("MODEL_PATH", "")
     if full == active_path or filename == os.path.basename(active_path):
         return {"status": "error", "message": f"'{filename}' is the active model; activate another model first."}
 
@@ -739,17 +786,18 @@ async def test_prompt(payload: TestPrompt):
 def _scan_models() -> list[dict]:
     """List model files in MODEL_DIR, enriched with GGUF metadata."""
     model_dir = os.getenv("MODEL_DIR", "/models")
-    active_path = os.getenv("MODEL_PATH", "")
+    active_path = getattr(settings, "model_path", None) or os.getenv("MODEL_PATH", "")
     models = []
     try:
         if os.path.isdir(model_dir):
             for f in sorted(os.listdir(model_dir)):
                 if f.lower().endswith((".gguf", ".bin")):
                     full = os.path.join(model_dir, f)
+                    is_active = (f == os.path.basename(active_path) or full == active_path)
                     models.append({
                         "filename": f,
                         "size_mb": round(os.path.getsize(full) / 1024 / 1024, 1),
-                        "active": f == os.path.basename(active_path),
+                        "active": is_active,
                         "metadata": read_gguf_metadata(full),
                     })
     except Exception as e:
