@@ -441,12 +441,19 @@ def _job_metadata(user_id: str, result: dict, status: str, duration: int, error:
     return meta
 
 
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(
     title="SMS Finance LLM Service",
     description="Autonomous DB-to-DB SMS financial processor with local llama.cpp",
     version="1.2.0",
     lifespan=lifespan,
+    swagger_favicon_url="/static/favicon.ico",
 )
+
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 app.include_router(admin_router)
 
