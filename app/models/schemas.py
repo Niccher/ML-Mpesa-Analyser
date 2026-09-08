@@ -67,6 +67,7 @@ class MessageExtraction(BaseModel):
     transaction_type: TransactionType = TransactionType.unknown
     category: Optional[str] = None
     counterparty_type: Optional[str] = None
+    currency: Optional[str] = "KES"
     is_abnormal: bool = False
     normality_assessment: Optional[str] = None
     savings_impact: Optional[str] = None

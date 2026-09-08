@@ -492,6 +492,18 @@ An autonomous **DB-to-DB SMS & Financial Transaction Processor** powered by loca
     swagger_favicon_url="/static/favicon.ico",
 )
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.middleware("http")
+async def verify_internal_service_secret(request: Request, call_next):
+    internal_secret = os.getenv("ML_INTERNAL_SECRET", "").strip()
+    if internal_secret and (request.url.path.startswith("/process") or request.url.path.startswith("/admin")):
+        client_secret = request.headers.get("X-Internal-Secret", "").strip()
+        if client_secret != internal_secret:
+            return JSONResponse(status_code=403, content={"status": "forbidden", "message": "Invalid internal service secret"})
+    return await call_next(request)
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
