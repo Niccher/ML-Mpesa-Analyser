@@ -47,6 +47,10 @@ from app.utils.prompt_templates import DEFAULT_PROMPTS, FINANCE_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
+# Telemetry module-level caches to avoid heavy repeated /proc and stat syscalls
+_CACHED_LLAMA_PID: Optional[int] = None
+_CACHED_MODEL_SIZE: tuple[str, float] = ("", 0.0)
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
@@ -1147,8 +1151,22 @@ async def get_telemetry():
                 if len(parts) >= 2 and parts[1].isdigit():
                     python_rss_mb = round((int(parts[1]) * page_size) / (1024 * 1024), 1)
 
-        # Scan for llama-server
-        if os.path.isdir("/proc"):
+        # Validate cached llama-server PID first to avoid scanning all /proc entries
+        global _CACHED_LLAMA_PID
+        if '_CACHED_LLAMA_PID' in globals() and _CACHED_LLAMA_PID is not None:
+            cmd_path = f"/proc/{_CACHED_LLAMA_PID}/cmdline"
+            if os.path.exists(cmd_path):
+                try:
+                    with open(cmd_path, "rb") as cf:
+                        if "llama-server" in cf.read().decode("utf-8", errors="ignore"):
+                            llama_pid = _CACHED_LLAMA_PID
+                except Exception:
+                    llama_pid = None
+            if llama_pid is None:
+                _CACHED_LLAMA_PID = None
+
+        # Fallback to scan /proc only if cached PID is dead or not found
+        if llama_pid is None and os.path.isdir("/proc"):
             for p in os.listdir("/proc"):
                 if p.isdigit():
                     try:
@@ -1156,14 +1174,16 @@ async def get_telemetry():
                             c = cf.read().decode("utf-8", errors="ignore")
                             if "llama-server" in c:
                                 llama_pid = int(p)
-                                if os.path.exists(f"/proc/{p}/statm"):
-                                    with open(f"/proc/{p}/statm", "r") as sf:
-                                        sp = sf.read().split()
-                                        if len(sp) >= 2 and sp[1].isdigit():
-                                            llama_rss_mb = round((int(sp[1]) * page_size) / (1024 * 1024), 1)
+                                _CACHED_LLAMA_PID = llama_pid
                                 break
                     except Exception:
                         pass
+
+        if llama_pid is not None and os.path.exists(f"/proc/{llama_pid}/statm"):
+            with open(f"/proc/{llama_pid}/statm", "r") as sf:
+                sp = sf.read().split()
+                if len(sp) >= 2 and sp[1].isdigit():
+                    llama_rss_mb = round((int(sp[1]) * page_size) / (1024 * 1024), 1)
     except Exception:
         pass
 
@@ -1209,9 +1229,13 @@ async def get_telemetry():
     active_model_path = os.getenv("MODEL_PATH", "")
     active_model_name = os.path.basename(active_model_path) if active_model_path else (settings.llm_model or "None")
     model_size_mb = 0.0
-    if active_model_path and os.path.isfile(active_model_path):
+    global _CACHED_MODEL_SIZE
+    if '_CACHED_MODEL_SIZE' in globals() and _CACHED_MODEL_SIZE[0] == active_model_path and _CACHED_MODEL_SIZE[1] > 0:
+        model_size_mb = _CACHED_MODEL_SIZE[1]
+    elif active_model_path and os.path.isfile(active_model_path):
         try:
             model_size_mb = round(os.path.getsize(active_model_path) / (1024 * 1024), 1)
+            _CACHED_MODEL_SIZE = (active_model_path, model_size_mb)
         except Exception:
             pass
 
