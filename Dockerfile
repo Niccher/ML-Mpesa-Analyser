@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         libgomp1 \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 # ── 1. Python dependencies — installed FIRST before any heavy files ───────────

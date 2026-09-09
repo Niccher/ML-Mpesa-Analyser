@@ -411,7 +411,26 @@ async def _restart_llama_server(model_path: str) -> str:
         return "Model activated in database & configuration."
 
     try:
-        subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=5)
+        if shutil.which("pkill"):
+            subprocess.run(["pkill", "-f", "llama-server"], capture_output=True, timeout=5)
+        else:
+            # Fallback: scan /proc for running llama-server instances
+            try:
+                import signal
+                current_pid = os.getpid()
+                if os.path.isdir("/proc"):
+                    for pid_str in os.listdir("/proc"):
+                        if pid_str.isdigit() and int(pid_str) != current_pid:
+                            try:
+                                cmdline_path = os.path.join("/proc", pid_str, "cmdline")
+                                with open(cmdline_path, "rb") as f:
+                                    cmdline = f.read().decode("utf-8", errors="ignore")
+                                    if "llama-server" in cmdline:
+                                        os.kill(int(pid_str), signal.SIGTERM)
+                            except (OSError, IOError):
+                                pass
+            except Exception as pe:
+                logger.warning(f"Fallback process termination note: {pe}")
         await asyncio.sleep(1)
 
         port = os.getenv("LLAMA_PORT", "8080")
@@ -1045,3 +1064,219 @@ def _set_env(key: str, value: str, path: str) -> None:
             f.writelines(lines)
     except Exception as e:
         logger.error(f"Failed to update env file {path}: {e}")
+
+
+@router.get("/telemetry")
+async def get_telemetry():
+    """Real-time container & inference telemetry: CPU, RAM, GPU/VRAM, model and queues."""
+    import resource
+
+    # 1. CPU metrics
+    cpu_cores = os.cpu_count() or 1
+    load_1m, load_5m, load_15m = 0.0, 0.0, 0.0
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+    except Exception:
+        pass
+
+    # 2. Host and Container Memory (RAM)
+    mem_total_mb = 0.0
+    mem_avail_mb = 0.0
+    mem_used_mb = 0.0
+    try:
+        if os.path.exists("/proc/meminfo"):
+            mem_data = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        k = parts[0].strip()
+                        v = parts[1].strip().split()[0]
+                        if v.isdigit():
+                            mem_data[k] = int(v)
+            if "MemTotal" in mem_data:
+                mem_total_mb = round(mem_data["MemTotal"] / 1024, 1)
+                mem_avail = mem_data.get("MemAvailable", mem_data.get("MemFree", 0))
+                mem_avail_mb = round(mem_avail / 1024, 1)
+                mem_used_mb = max(0.0, round(mem_total_mb - mem_avail_mb, 1))
+    except Exception:
+        pass
+
+    # Container-specific cgroups memory limit and usage
+    container_mem_used_mb = None
+    container_mem_limit_mb = None
+    try:
+        # cgroup v2
+        cg2_cur = "/sys/fs/cgroup/memory.current"
+        cg2_max = "/sys/fs/cgroup/memory.max"
+        if os.path.isfile(cg2_cur):
+            with open(cg2_cur, "r") as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    container_mem_used_mb = round(int(val) / (1024 * 1024), 1)
+        if os.path.isfile(cg2_max):
+            with open(cg2_max, "r") as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    container_mem_limit_mb = round(int(val) / (1024 * 1024), 1)
+        # cgroup v1 fallback
+        if container_mem_used_mb is None and os.path.isfile("/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    container_mem_used_mb = round(int(val) / (1024 * 1024), 1)
+        if container_mem_limit_mb is None and os.path.isfile("/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    lim = int(val)
+                    if lim < 9223372036854771712:  # Not unlimited
+                        container_mem_limit_mb = round(lim / (1024 * 1024), 1)
+    except Exception:
+        pass
+
+    # 3. Process RSS Memory
+    python_rss_mb = 0.0
+    llama_rss_mb = 0.0
+    llama_pid = None
+    try:
+        page_size = resource.getpagesize()
+        if os.path.exists("/proc/self/statm"):
+            with open("/proc/self/statm", "r") as f:
+                parts = f.read().split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    python_rss_mb = round((int(parts[1]) * page_size) / (1024 * 1024), 1)
+
+        # Scan for llama-server
+        if os.path.isdir("/proc"):
+            for p in os.listdir("/proc"):
+                if p.isdigit():
+                    try:
+                        with open(f"/proc/{p}/cmdline", "rb") as cf:
+                            c = cf.read().decode("utf-8", errors="ignore")
+                            if "llama-server" in c:
+                                llama_pid = int(p)
+                                if os.path.exists(f"/proc/{p}/statm"):
+                                    with open(f"/proc/{p}/statm", "r") as sf:
+                                        sp = sf.read().split()
+                                        if len(sp) >= 2 and sp[1].isdigit():
+                                            llama_rss_mb = round((int(sp[1]) * page_size) / (1024 * 1024), 1)
+                                break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 4. GPU / VRAM Telemetry via nvidia-smi
+    gpu_data = {
+        "has_gpu": False,
+        "mode": "CPU Inference (AVX2 / OpenMP Vectorized)",
+        "gpus": []
+    }
+    if shutil.which("nvidia-smi"):
+        try:
+            import subprocess
+            proc = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,driver_version,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                gpus = []
+                for line in proc.stdout.strip().split("\n"):
+                    cols = [c.strip() for c in line.split(",")]
+                    if len(cols) >= 7:
+                        gpus.append({
+                            "name": cols[0],
+                            "driver_version": cols[1],
+                            "memory_total_mb": float(cols[2]),
+                            "memory_used_mb": float(cols[3]),
+                            "memory_free_mb": float(cols[4]),
+                            "utilization_gpu_pct": int(cols[5]) if cols[5].isdigit() else 0,
+                            "temperature_c": int(cols[6]) if cols[6].isdigit() else 0,
+                        })
+                if gpus:
+                    gpu_data = {
+                        "has_gpu": True,
+                        "mode": "NVIDIA GPU Accelerated",
+                        "gpus": gpus
+                    }
+        except Exception as e:
+            gpu_data["error"] = str(e)
+
+    # 5. Model details
+    active_model_path = os.getenv("MODEL_PATH", "")
+    active_model_name = os.path.basename(active_model_path) if active_model_path else (settings.llm_model or "None")
+    model_size_mb = 0.0
+    if active_model_path and os.path.isfile(active_model_path):
+        try:
+            model_size_mb = round(os.path.getsize(active_model_path) / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+    # 6. Active Jobs Queue
+    active_jobs = 0
+    queued_jobs = 0
+    completed_today = 0
+    try:
+        from app.db.connection import get_engine as _ge
+        from sqlalchemy import text as _text
+        engine = _ge()
+        async with engine.connect() as conn:
+            r = await conn.execute(_text("SELECT status, COUNT(*) FROM tbl_Processing_Jobs WHERE status IN ('processing','starting','queued') GROUP BY status"))
+            for row in r.fetchall():
+                st = row[0]
+                cnt = int(row[1])
+                if st in ('processing', 'starting'):
+                    active_jobs += cnt
+                elif st == 'queued':
+                    queued_jobs += cnt
+
+            r_today = await conn.execute(_text("SELECT COUNT(*) FROM tbl_Processing_Jobs WHERE status IN ('done','completed') AND DATE(completed_at) = CURDATE()"))
+            row_today = r_today.fetchone()
+            if row_today:
+                completed_today = int(row_today[0])
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": _uptime(),
+        "cpu": {
+            "cores": cpu_cores,
+            "load_1m": load_1m,
+            "load_5m": load_5m,
+            "load_15m": load_15m,
+            "load_pct": min(100, round((load_1m / cpu_cores) * 100, 1)) if cpu_cores else 0
+        },
+        "memory": {
+            "host_total_mb": mem_total_mb,
+            "host_available_mb": mem_avail_mb,
+            "host_used_mb": mem_used_mb,
+            "host_used_pct": round((mem_used_mb / mem_total_mb) * 100, 1) if mem_total_mb > 0 else 0,
+            "container_used_mb": container_mem_used_mb or mem_used_mb,
+            "container_limit_mb": container_mem_limit_mb,
+            "python_rss_mb": python_rss_mb,
+            "llama_rss_mb": llama_rss_mb,
+        },
+        "gpu": gpu_data,
+        "inference": {
+            "engine": settings.llm_engine,
+            "provider": settings.llm_provider,
+            "active_model": active_model_name,
+            "model_size_mb": model_size_mb,
+            "ctx_size": settings.llm_ctx_size,
+            "batch_size": settings.llm_batch_size,
+            "n_gpu_layers": settings.n_gpu_layers,
+            "llama_port": os.getenv("LLAMA_PORT", "8080"),
+            "llama_pid": llama_pid,
+            "llama_running": llama_pid is not None
+        },
+        "queue": {
+            "active_jobs": active_jobs,
+            "queued_jobs": queued_jobs,
+            "completed_today": completed_today
+        }
+    }
