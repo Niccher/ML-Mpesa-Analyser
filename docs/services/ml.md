@@ -4,35 +4,29 @@ This document describes the model architecture, prompt engineering strategies, a
 
 ---
 
-## 1. Active Model: Qwen2.5 1.5B Instruct
+## 1. Active & Supported Models
 
-The system runs [Qwen2.5 1.5B Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF) in `Q4_K_M` quantization format.
+The system natively supports GGUF models optimized with `llama.cpp`:
 
-| Property | Value | Notes |
-|----------|-------|-------|
-| **Parameters** | 1.54 Billion | Transformer architecture with RoPE embeddings |
-| **Quantization** | Q4_K_M (4-bit medium) | File size ~1.1 GB, RAM footprint ~1.5 GB |
-| **Context Window** | 16,384 tokens | Accommodates multi-SMS batch evaluation |
-| **Inference Hardware** | CPU-only | Standard x86 AVX2 / ARM NEON acceleration |
-| **Throughput** | 15–25 tokens/sec | Modern multi-core CPU |
+| Property | Qwen2.5 1.5B Instruct | Qwen2.5 3B Instruct (Recommended) | Llama 3.2 3B Instruct |
+|----------|----------------------|-----------------------------------|-----------------------|
+| **Parameters** | 1.54 Billion | 3.09 Billion | 3.21 Billion |
+| **Quantization** | Q4_K_M (4-bit medium) | Q4_K_M (4-bit medium) | Q4_K_M (4-bit medium) |
+| **File Size** | ~1.1 GB | ~2.0 GB | ~2.0 GB |
+| **RAM Footprint** | ~1.5 GB | ~2.5 GB | ~2.6 GB |
+| **Context Window** | 16,384 tokens | 32,768 tokens | 8,192 tokens |
+| **Hardware** | 2-4 Cores, AVX2 | 4+ Cores, AVX2 / CUDA | 4+ Cores, AVX2 / CUDA |
+| **Throughput** | 20–30 tokens/sec | 12–20 tokens/sec | 14–22 tokens/sec |
 
 ---
 
-## 2. Model Switching & Alternatives
+## 2. Model Presets & Dynamic Activation
 
-Any GGUF model supported by llama.cpp can be placed in `models/` and activated via the admin API or `.env`:
+Admins can download and activate presets directly from the WebApp:
 
-| Model | Parameters | Size (Q4_K_M) | Trade-Off |
-|-------|:----------:|:-------------:|-----------|
-| **Qwen2.5 1.5B** *(Active)* | 1.5B | 1.1 GB | Optimal balance of speed, low RAM, and JSON syntax adherence. |
-| **Llama 3.2 1B** | 1.2B | 0.8 GB | Fastest extraction, slightly lower counterparty extraction accuracy. |
-| **Llama 3.2 3B** | 3.2B | 2.0 GB | Higher reasoning quality on ambiguous notifications; requires 3+ GB RAM. |
-| **Phi-3 Mini 3.8B** | 3.8B | 2.5 GB | Exceptional instruction adherence, higher CPU utilization. |
-
-To switch models:
-1. Place the new `.gguf` file in `models/`.
-2. Update `MODEL_PATH` and `LLM_MODEL` in `.env`.
-3. Restart: `docker compose up -d --build`.
+1. **One-Click Downloads**: Pulls validated GGUF weights from Hugging Face into `models/`.
+2. **Pre-Flight Validation**: Checks host disk space and RAM headroom before starting downloads.
+3. **Hot Reload**: Calls `/admin/models/activate` which safely reloads `llama-server` with the selected model.
 
 ---
 
@@ -60,4 +54,4 @@ Unknown senders are sent to the LLM with up to 10 sample messages to classify wh
 Prompts are managed by `prompt_manager.py`:
 - Checks `tbl_LLM_Prompts` for an active override by key (`classify_sender`, `extract_batch`).
 - If none is active, falls back to the hardcoded default in `prompt_templates.py`.
-- Admin API (`POST /admin/prompts`) saves new versions without overwriting historical templates.
+- Admin API (`POST /admin/prompts`) saves new versions without overwriting historical templates.\n

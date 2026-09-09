@@ -1,6 +1,6 @@
 # FastAPI Service Handbook — ML Mpesa Analyzer
 
-This document details the code structure and runtime components of the FastAPI service located in `app/`.
+This document details the code structure, background routines, telemetry endpoint, and process management of the FastAPI service located in `app/`.
 
 ---
 
@@ -16,7 +16,7 @@ app/
 ├── models/
 │   └── schemas.py             # Pydantic request/response schemas and enums
 ├── routers/
-│   └── admin.py               # Router for /admin/* endpoints
+│   └── admin.py               # Router for /admin/* (telemetry, models, prompts, controls)
 ├── services/
 │   ├── classifier.py          # Known-dict lookup & LLM sender classification
 │   ├── extractor.py           # Batch transaction parser & JSON adherence engine
@@ -42,7 +42,27 @@ Implemented via `asyncio.create_task` during application startup (`app/main.py` 
 
 ---
 
-## 3. Database Session Handling
+## 3. Real-Time Telemetry Endpoint (`/admin/telemetry`)
 
-- Uses `SQLAlchemy` with `aiomysql` driver (`mysql+aiomysql://...`).
-- Database connections use a scoped session factory to prevent connection leaks across async worker routines.
+Located in `app/routers/admin.py`, this endpoint supplies live metrics to the WebApp control center:
+
+- **FastAPI Process Vitals**: Extracts PID, resident memory (RSS), and virtual memory via `psutil`.
+- **Llama Server Daemon Vitals**: Detects the `llama-server` process ID, memory footprint, active port, and uptime.
+- **Active Model Metrics**: Reads active GGUF model path, parameter count, quantization method, and context window size.
+- **Queue Diagnostics**: Reports pending unclassified SMS count and active job processing state.
+
+---
+
+## 4. Llama-Server Process Management
+
+When an admin activates a new model preset from the WebApp:
+
+1. `_restart_llama_server()` sends `SIGTERM` to the active daemon.
+2. Waits gracefully for socket cleanup.
+3. Spawns a new `llama-server` sub-process with optimized flags:
+   - `-m <model_path>`
+   - `-c <context_size>` (default 4096 / 8192)
+   - `-b <batch_size>` (default 512)
+   - `-t <cpu_threads>` (derived from available host cores)
+   - `--port 8080`
+4. Performs health check loop against `http://localhost:8080/health` before marking the model ready.\n
